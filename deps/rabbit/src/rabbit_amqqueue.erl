@@ -772,6 +772,7 @@ declare_args() ->
      {<<"x-message-ttl">>,             fun check_message_ttl_arg/2},
      {<<"x-dead-letter-exchange">>,    fun check_dlxname_arg/2},
      {<<"x-dead-letter-routing-key">>, fun check_dlxrk_arg/2},
+     {<<"x-dead-letter-strategy">>,    fun check_dlxstrategy_arg/2},
      {<<"x-max-length">>,              fun check_non_neg_int_arg/2},
      {<<"x-max-length-bytes">>,        fun check_non_neg_int_arg/2},
      {<<"x-max-in-memory-length">>,    fun check_non_neg_int_arg/2},
@@ -925,19 +926,35 @@ check_dlxname_arg(Val, _) when is_list(Val) or is_binary(Val) -> ok;
 check_dlxname_arg(_Val, _) -> {error, {unacceptable_type, "expected a string (valid exchange name)"}}.
 
 check_dlxrk_arg({longstr, _}, Args) ->
-    case rabbit_misc:table_lookup(Args, <<"x-dead-letter-exchange">>) of
-        undefined -> {error, routing_key_but_no_dlx_defined};
-        _         -> ok
-    end;
+    ensure_dead_letter_exchange(Args, routing_key_but_no_dlx_defined);
 check_dlxrk_arg({Type,    _}, _Args) ->
     {error, {unacceptable_type, Type}};
 check_dlxrk_arg(Val, Args) when is_binary(Val) ->
-    case rabbit_misc:table_lookup(Args, <<"x-dead-letter-exchange">>) of
-        undefined -> {error, routing_key_but_no_dlx_defined};
-        _         -> ok
-    end;
+    ensure_dead_letter_exchange(Args, routing_key_but_no_dlx_defined);
 check_dlxrk_arg(_Val, _Args) ->
     {error, {unacceptable_type, "expected a string"}}.
+
+-define(KNOWN_DLX_STRATEGIES, [<<"at-least-once">>, <<"at-most-once">>]).
+check_dlxstrategy_arg({longstr, Val}, Args) ->
+    case lists:member(Val, ?KNOWN_DLX_STRATEGIES) of
+        true -> ensure_dead_letter_exchange(Args, dlx_strategy_but_no_dlx_defined);
+        false -> {error, invalid_dlx_strategy}
+    end;
+check_dlxstrategy_arg({Type,    _}, _Args) ->
+    {error, {unacceptable_type, Type}};
+check_dlxstrategy_arg(Val, Args) when is_binary(Val) ->
+    case lists:member(Val, ?KNOWN_DLX_STRATEGIES) of
+        true -> ensure_dead_letter_exchange(Args, dlx_strategy_but_no_dlx_defined);
+        false -> {error, invalid_dlx_strategy}
+    end;
+check_dlxstrategy_arg(_Val, _Args) ->
+    {error, invalid_dlx_strategy}.
+
+ensure_dead_letter_exchange(Args, Error) ->
+    case rabbit_misc:table_lookup(Args, <<"x-dead-letter-exchange">>) of
+        undefined -> {error, Error};
+        _         -> ok
+    end.
 
 -define(KNOWN_OVERFLOW_MODES, [<<"drop-head">>, <<"reject-publish">>, <<"reject-publish-dlx">>]).
 check_overflow({longstr, Val}, _Args) ->
@@ -1628,8 +1645,8 @@ credit(Q, CTag, Credit, Drain, QStates) ->
           {'ok', non_neg_integer(), qmsg(), rabbit_queue_type:state()} |
           {'empty', rabbit_queue_type:state()} |
           {protocol_error, Type :: atom(), Reason :: string(), Args :: term()}.
-basic_get(Q, NoAck, LimiterPid, CTag, QStates0) ->
-    rabbit_queue_type:dequeue(Q, NoAck, LimiterPid, CTag, QStates0).
+basic_get(Q, NoAck, LimiterPid, CTag, QStates) ->
+    rabbit_queue_type:dequeue(Q, NoAck, LimiterPid, CTag, QStates).
 
 
 -spec basic_consume(amqqueue:amqqueue(), boolean(), pid(), pid(), boolean(),
@@ -1641,7 +1658,7 @@ basic_get(Q, NoAck, LimiterPid, CTag, QStates0) ->
     {protocol_error, Type :: atom(), Reason :: string(), Args :: term()}.
 basic_consume(Q, NoAck, ChPid, LimiterPid,
               LimiterActive, ConsumerPrefetchCount, ConsumerTag,
-              ExclusiveConsume, Args, OkMsg, ActingUser, Contexts) ->
+              ExclusiveConsume, Args, OkMsg, ActingUser, QStates) ->
 
     QName = amqqueue:get_name(Q),
     %% first phase argument validation
@@ -1657,7 +1674,7 @@ basic_consume(Q, NoAck, ChPid, LimiterPid,
              args => Args,
              ok_msg => OkMsg,
              acting_user =>  ActingUser},
-    rabbit_queue_type:consume(Q, Spec, Contexts).
+    rabbit_queue_type:consume(Q, Spec, QStates).
 
 -spec basic_cancel(amqqueue:amqqueue(), rabbit_types:ctag(), any(),
                    rabbit_types:username(),

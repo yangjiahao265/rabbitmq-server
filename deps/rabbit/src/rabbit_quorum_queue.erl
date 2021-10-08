@@ -236,9 +236,12 @@ ra_machine_config(Q) when ?is_amqqueue(Q) ->
     Expires = args_policy_lookup(<<"expires">>,
                                  fun (A, _B) -> A end,
                                  Q),
+    DeadLetterStrategy = args_policy_lookup(<<"dead-letter-strategy">>,
+                                            fun (A, _B) -> A end,
+                                            Q),
     #{name => Name,
       queue_resource => QName,
-      dead_letter_handler => dlx_mfa(Q),
+      dead_letter_handler => dead_letter_handler(DeadLetterStrategy, Q),
       become_leader_handler => {?MODULE, become_leader, [QName]},
       max_length => MaxLength,
       max_bytes => MaxBytes,
@@ -293,7 +296,7 @@ become_leader(QName, Name) ->
           end,
     %% as this function is called synchronously when a ra node becomes leader
     %% we need to ensure there is no chance of blocking as else the ra node
-    %% may not be able to establish it's leadership
+    %% may not be able to establish its leadership
     spawn(fun() ->
                   rabbit_misc:execute_mnesia_transaction(
                     fun() ->
@@ -384,12 +387,12 @@ capabilities() ->
             %% Stream policies
             <<"max-age">>, <<"stream-max-segment-size-bytes">>,
             <<"queue-leader-locator">>, <<"initial-cluster-size">>],
-      queue_arguments => [<<"x-expires">>, <<"x-dead-letter-exchange">>,
-                          <<"x-dead-letter-routing-key">>, <<"x-max-length">>,
-                          <<"x-max-length-bytes">>, <<"x-max-in-memory-length">>,
-                          <<"x-max-in-memory-bytes">>, <<"x-overflow">>,
-                          <<"x-single-active-consumer">>, <<"x-queue-type">>,
-                          <<"x-quorum-initial-group-size">>, <<"x-delivery-limit">>],
+          queue_arguments => [<<"x-dead-letter-exchange">>, <<"x-dead-letter-routing-key">>,
+                              <<"x-dead-letter-strategy">>, <<"x-expires">>, <<"x-max-length">>,
+                              <<"x-max-length-bytes">>, <<"x-max-in-memory-length">>,
+                              <<"x-max-in-memory-bytes">>, <<"x-overflow">>,
+                              <<"x-single-active-consumer">>, <<"x-queue-type">>,
+                              <<"x-quorum-initial-group-size">>, <<"x-delivery-limit">>],
       consumer_arguments => [<<"x-priority">>, <<"x-credit">>],
       server_named => false}.
 
@@ -1239,18 +1242,30 @@ reclaim_memory(Vhost, QueueName) ->
     ra_log_wal:force_roll_over({?RA_WAL_NAME, Node}).
 
 %%----------------------------------------------------------------------------
-dlx_mfa(Q) ->
-    DLX = init_dlx(args_policy_lookup(<<"dead-letter-exchange">>,
-                                      fun res_arg/2, Q), Q),
-    DLXRKey = args_policy_lookup(<<"dead-letter-routing-key">>,
-                                 fun res_arg/2, Q),
-    {?MODULE, dead_letter_publish, [DLX, DLXRKey, amqqueue:get_name(Q)]}.
+dead_letter_handler(Stategy, Q) ->
+    DLXName = args_policy_lookup(<<"dead-letter-exchange">>, fun res_arg/2, Q),
+    case init_dlx(DLXName, Q) of
+        undefined ->
+            undefined;
+        DLX ->
+            DLXRKey = args_policy_lookup(<<"dead-letter-routing-key">>, fun res_arg/2, Q),
+            MFA = {?MODULE, dead_letter_publish, [DLX, DLXRKey, amqqueue:get_name(Q)]},
+            dead_letter_handler0(Stategy, MFA)
+    end.
 
 init_dlx(undefined, _Q) ->
     undefined;
 init_dlx(DLX, Q) when ?is_amqqueue(Q) ->
     QName = amqqueue:get_name(Q),
     rabbit_misc:r(QName, exchange, DLX).
+
+%% For at-least-once, we still need the at-most-once semantics provided by MFA for overflow strategy drop_head.
+dead_letter_handler0(undefined, MFA) ->
+    {at_least_once, MFA};
+dead_letter_handler0(<<"at-least-once">>, MFA) ->
+    {at_least_once, MFA};
+dead_letter_handler0(<<"at-most-once">>, MFA) ->
+    {at_most_once, MFA}.
 
 res_arg(_PolVal, ArgVal) -> ArgVal.
 
@@ -1568,7 +1583,7 @@ overflow(undefined, Def, _QName) -> Def;
 overflow(<<"reject-publish">>, _Def, _QName) -> reject_publish;
 overflow(<<"drop-head">>, _Def, _QName) -> drop_head;
 overflow(<<"reject-publish-dlx">> = V, Def, QName) ->
-    rabbit_log:warning("Invalid overflow strategy ~p for quorum queue: ~p",
+    rabbit_log:warning("Invalid overflow strategy ~p for quorum queue: ~s",
                        [V, rabbit_misc:rs(QName)]),
     Def.
 
