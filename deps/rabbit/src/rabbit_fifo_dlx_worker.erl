@@ -14,6 +14,7 @@
 -module(rabbit_fifo_dlx_worker).
 
 -include_lib("rabbit_common/include/rabbit.hrl").
+-include_lib("rabbit_common/include/rabbit_framing.hrl").
 
 -behaviour(gen_server2).
 
@@ -40,14 +41,24 @@
           %% message IDs directly back to the queue (and there is no AMQP consumer).
           consumed_msg_id :: non_neg_integer(),
           content :: rabbit_types:decoded_content(),
+          %% TODO Reason is already stored in first x-death header of #content.properties.#'P_basic'.headers
+          %% So, we could remove this convenience field and lookup the 1st header when redelivering.
+          reason :: rabbit_fifo_dlx:reason(),
           %% target queues for which publisher confirm has not been received yet
-          unsettled :: [rabbit_amqqueue:name()],
+          unsettled = [] :: [rabbit_amqqueue:name()],
           %% target queues for which publisher confirm was received
-          settled :: [rabbit_amqqueue:name()],
-          %% number of times the message was (tried to be) published
-          count :: non_neg_integer(),
-          %% epoch time in milliseconds when the message was last (tried to be) published
-          last_publish :: integer()
+          settled = [] :: [rabbit_amqqueue:name()],
+          %% Number of times the message was published (i.e. rabbit_queue_type:deliver/3 invoked).
+          %% Can be 0 if the message was never published (for example no route exists).
+          publish_count = 0 :: non_neg_integer(),
+          %% Epoch time in milliseconds when the message was last published (i.e. rabbit_queue_type:deliver/3 invoked).
+          %% It can be 'undefined' if the message was never published (for example no route exists).
+          last_published_at :: undefined | integer(),
+          %% Epoch time in milliseconds when the message was consumed from the source quorum queue.
+          %% This value never changes.
+          %% It's mainly informational and meant for debugging to understand for how long the message
+          %% is sitting around without having received all publisher confirms.
+          consumed_at :: integer()
          }).
 
 -record(state, {
@@ -72,6 +83,8 @@
          }).
 
 -type state() :: #state{}.
+
+%%TODO add metrics like global counters for messages routed, delivered, etc.
 
 start_link(QRef, RegName) ->
     gen_server:start_link({local, RegName},
@@ -165,63 +178,116 @@ handle_queue_actions(Actions, State0) ->
 
 handle_deliver(Msgs, #state{consumer_queue_ref = QRef} = State) when is_list(Msgs) ->
     {DLXRef, DLX, DLRKey} = lookup_dlx(QRef),
-    lists:foldl(fun({_QRef, MsgId, #basic_message{content = Content}}, S) ->
-                        deliver(Content, DLXRef, DLX, DLRKey, MsgId, 0, [], S)
+    lists:foldl(fun({_QRef, MsgId, Msg, Reason}, S) ->
+                        forward(Msg, MsgId, QRef, DLXRef, DLX, DLRKey, Reason, S)
                 end, State, Msgs).
 
-deliver(Content, DLXRef, DLX, DLRKey, ConsumedMsgId, Count, Settled,
+%% Lookup policies and routes before delivering because they can change dynamically.
+%% TODO Keep the configured dead-letter-routing-key and dead-letter-exchange policies in our state and
+%% have rabbitmq_quorum_queue:policy_changed/1 notify us when policy changes instead of doing a lookup
+%% here every time.
+lookup_dlx({resource, Vhost, queue, _} = QRef) ->
+    {ok, Q} = rabbit_amqqueue:lookup(QRef),
+    DLRKey = rabbit_queue_type_util:args_policy_lookup(<<"dead-letter-routing-key">>, fun res_arg/2, Q),
+    DLXName = rabbit_queue_type_util:args_policy_lookup(<<"dead-letter-exchange">>, fun res_arg/2, Q),
+    DLXRef = rabbit_misc:r(Vhost, exchange, DLXName),
+    DLX = case rabbit_exchange:lookup(DLXRef) of
+              {error, not_found} ->
+                  rabbit_log:warning("Cannot forward any dead-letter messages from source quorum ~s because its configured "
+                                     "dead-letter-exchange ~s does not exist. "
+                                     "Either create the configured dead-letter-exchange or re-configure "
+                                     "the dead-letter-exchange policy for the source quorum queue to prevent "
+                                     "dead-lettered messages from piling up in the source quorum queue.",
+                                     [rabbit_misc:rs(QRef), rabbit_misc:rs(DLXRef)]),
+                  not_found;
+              {ok, X} ->
+                  X
+          end,
+    {DLXRef, DLX, DLRKey}.
+
+forward(ConsumedMsg, ConsumedMsgId, ConsumedQRef, DLXRef, DLX, DLRKey, Reason,
         #state{next_out_seq = OutSeq,
                pendings = Pendings} = State0) ->
-    {ok, BasicMsg} = rabbit_basic:message(DLXRef, DLRKey, Content),
+    #basic_message{content = Content, routing_keys = RKeys} = Msg =
+    rabbit_dead_letter:make_msg(ConsumedMsg, Reason, DLXRef, DLRKey, ConsumedQRef),
     %% Field 'mandatory' is set to false because our module checks on its own whether the message is routable.
-    Delivery = rabbit_basic:delivery(_Mandatory = false, _Confirm = true, BasicMsg, OutSeq),
-    QNames = rabbit_exchange:route(DLX, Delivery),
-    %% When this is a re-deliver, we won't send to queues for which we already received a publisher confirm.
-    RouteToQNames = QNames -- Settled,
-    Pend = #pending{
-              consumed_msg_id = ConsumedMsgId,
-              content = Content,
-              unsettled = RouteToQNames,
-              settled = Settled,
-              count = Count + 1,
-              last_publish = os:system_time(millisecond)
-             },
-    State1 = State0#state{next_out_seq = OutSeq + 1,
-                          pendings = maps:put(OutSeq, Pend, Pendings)},
-    case RouteToQNames of
-        [] when Settled =:= []->
-            rabbit_log:warning("Cannot deliver message with sequence number ~b "
-                               "(for consumed message sequence number ~b) "
-                               "because no queue is bound to dead-letter ~s with routing key '~s'.",
-                               [OutSeq, ConsumedMsgId, rabbit_misc:rs(DLXRef), DLRKey]),
-            State1;
+    Delivery = rabbit_basic:delivery(_Mandatory = false, _Confirm = true, Msg, OutSeq),
+    TargetQs = case DLX of
+                   not_found ->
+                       [];
+                   _ ->
+                       RouteToQs = rabbit_exchange:route(DLX, Delivery),
+                       case rabbit_dead_letter:detect_cycles(Reason, Msg, RouteToQs) of
+                           {[], []} ->
+                               rabbit_log:warning("Cannot deliver message with sequence number ~b "
+                                                  "(for consumed message sequence number ~b) "
+                                                  "because no queue is bound to dead-letter ~s with routing key '~s'.",
+                                                  [OutSeq, ConsumedMsgId, rabbit_misc:rs(DLXRef), DLRKey]),
+                               [];
+                           {Qs, []} ->
+                               %% the "normal" case, i.e. no dead-letter-topology misconfiguration
+                               Qs;
+                           {[], Cycles} ->
+                               %%TODO introduce structured logging in rabbit_log by using type logger:report
+                               rabbit_log:warning("Cannot route to any queues. Detected dead-letter queue cycles. "
+                                                  "Fix the dead-letter routing topology to prevent dead-letter messages from "
+                                                  "piling up in source quorum queue. "
+                                                  "outgoing_sequene_number=~b "
+                                                  "consumed_message_sequence_number=~b "
+                                                  "consumed_queue=~s "
+                                                  "dead_letter_exchange=~s "
+                                                  "effective_dead_letter_routing_keys=~p "
+                                                  "routed_to_queues=~s "
+                                                  "dead_letter_queue_cycles=~p",
+                                                  [OutSeq, ConsumedMsgId, rabbit_misc:rs(ConsumedQRef),
+                                                   rabbit_misc:rs(DLXRef), RKeys, strings(RouteToQs), Cycles]),
+                               [];
+                           {Qs, Cycles} ->
+                               rabbit_log:warning("Detected dead-letter queue cycles. "
+                                                  "Fix the dead-letter routing topology. "
+                                                  "outgoing_sequene_number=~b "
+                                                  "consumed_message_sequence_number=~b "
+                                                  "consumed_queue=~s "
+                                                  "dead_letter_exchange=~s "
+                                                  "effective_dead_letter_routing_keys=~p "
+                                                  "routed_to_queues_desired=~s "
+                                                  "routed_to_queues_effective=~s "
+                                                  "dead_letter_queue_cycles=~p",
+                                                  [OutSeq, ConsumedMsgId, rabbit_misc:rs(ConsumedQRef),
+                                                   rabbit_misc:rs(DLXRef), RKeys, strings(RouteToQs), strings(Qs), Cycles]),
+                               %% Ignore the target queues resulting in cycles.
+                               %% We decide it's good enough to deliver to only routable target queues.
+                               Qs
+                       end
+               end,
+    Now = os:system_time(millisecond),
+    State1 = State0#state{next_out_seq = OutSeq + 1},
+    Pend0 = #pending{
+               consumed_msg_id = ConsumedMsgId,
+               consumed_at = Now,
+               content = Content,
+               reason = Reason
+              },
+    case TargetQs of
         [] ->
-            %% Original delivery timed out on publisher confirm.
-            %% However, route changed dynamically so that we don't need to route to any queues anymore.
-            %% This message will be acked later on.
-            State1;
+            %% We can't deliver this message since there is no target queue we can route to.
+            %% Under no circumstances should we drop a message with dead-letter-strategy at-least-once.
+            %% We buffer this message and retry to send every SETTLE_TIMEOUT milliseonds
+            %% (until the user has fixed the dead-letter routing topology).
+            State1#state{pendings = maps:put(OutSeq, Pend0, Pendings)};
         _ ->
-            %% This is the normal case. We (re)deliver message to target queues.
-            deliver_to_queues(Delivery, RouteToQNames, State1)
+            Pend = Pend0#pending{publish_count = 1,
+                                 last_published_at = Now,
+                                 unsettled = TargetQs},
+            State = State1#state{pendings = maps:put(OutSeq, Pend, Pendings)},
+            deliver_to_queues(Delivery, TargetQs, State)
     end.
 
 deliver_to_queues(Delivery, RouteToQNames, #state{queue_type_state = QTypeState0} = State0) ->
     Qs = rabbit_amqqueue:lookup(RouteToQNames),
     {ok, QTypeState1, Actions} = rabbit_queue_type:deliver(Qs, Delivery, QTypeState0),
     State = State0#state{queue_type_state = QTypeState1},
-    % rabbit_global_counters:messages_routed(amqp091, length(Qs)),
     handle_queue_actions(Actions, State).
-
-%% Lookup policies and routes before delivering because they can change dynamically.
-%% TODO rabbitmq_quorum_queue:policy_changed/1 should notify us when policy changes instead of doing a lookup
-%% here every time
-lookup_dlx({resource, Vhost, queue, _} = QRef) ->
-    {ok, Q} = rabbit_amqqueue:lookup(QRef),
-    DLRKey = rabbit_queue_type_util:args_policy_lookup(<<"dead-letter-routing-key">>, fun res_arg/2, Q),
-    DLXName = rabbit_queue_type_util:args_policy_lookup(<<"dead-letter-exchange">>, fun res_arg/2, Q),
-    DLXRef = rabbit_misc:r(Vhost, exchange, DLXName),
-    DLX = rabbit_exchange:lookup_or_die(DLXRef),
-    {DLXRef, DLX, DLRKey}.
 
 handle_settled(QRef, MsgSeqs, #state{pendings = Pendings0} = State0) ->
     Pendings1 = lists:foldl(fun (MsgSeq, P0) ->
@@ -273,48 +339,131 @@ maybe_ack(#state{pendings = Pendings0,
 
 redeliver_timed_out_messsages(#state{pendings = Pendings,
                                      consumer_queue_ref = SourceQRef} = State) ->
-    Now = os:system_time(millisecond),
-    {DLXRef, DLX, DLRKey} = lookup_dlx(SourceQRef),
-    maps:fold(fun(OutSeq, #pending{consumed_msg_id = CMsgId,
-                                   last_publish = LastPub,
-                                   count = Count,
-                                   content = Content,
-                                   unsettled = Unsettled,
-                                   settled = Settled}, S0) when LastPub + ?SETTLE_TIMEOUT =< Now ->
-                      %% Publisher confirm timed out.
-                      %%
-                      %% Quorum queues maintain their own Raft sequene number mapping to the message sequence number (= Raft correlation ID).
-                      %% So, they would just send us a 'settled' queue action containing the correct message sequence number.
-                      %%
-                      %% Classic queues however maintain their state by mapping the message sequence number to pending and confirmed queues.
-                      %% While re-using the same message sequence number could work there as well, it just gets unnecssary complicated when
-                      %% different target queues settle two separate deliveries referring to the same message sequence number (and same basic message).
-                      %%
-                      %% Therefore, to keep things simple, create a brand new delivery, store it in our state and forget about the old delivery and
-                      %% sequence number.
-                      %%
-                      %% If a sequene number gets settled after SETTLE_TIMEOUT, we can't map it anymore to the #pending{}. Hence, we ignore it.
-                      %%
-                      %% This can lead to issues when SETTLE_TIMEOUT is too low and time to settle takes too long.
-                      %% For example, if SETTLE_TIMEOUT is set to only 10 seconds, but settling a message takes always longer than 10 seconds
-                      %% (e.g. due to extremly slow hypervisor disks that ran out of credit), we will re-deliver the same message all over again
-                      %% leading to many duplicates in the target queue without ever acking the message back to the source discards queue.
-                      %%
-                      %% Therefore, set SETTLE_TIMEOUT reasonably high (e.g. 2 minutes).
-                      rabbit_log:debug("Redelivering message with sequence number ~b (for consumed message sequence number ~b) "
-                                       "that has been published ~b time(s) because of time out after ~bms waiting on publisher confirm. "
-                                       "Received confirm from: [~s]. Did not receive confirm from: [~s].",
-                                       [OutSeq, CMsgId, Count, ?SETTLE_TIMEOUT, strings(Settled), strings(Unsettled)]),
-                      #state{pendings = Pends0} = S = deliver(Content, DLXRef, DLX, DLRKey, CMsgId, Count, Settled, S0),
-                      Pends1 = maps:remove(OutSeq, Pends0),
-                      S#state{pendings = Pends1};
-                 (_OutSeq, _Pending, S) ->
-                      %% Publisher confirm did not time out (yet).
-                      S
-              end, State, Pendings).
+    case lookup_dlx(SourceQRef) of
+        {_, not_found, _} ->
+            %% Configured dead-letter-exchange does (still) not exist.
+            %% Warning got already logged.
+            %% Keep the same Pendings in our state until user creates or re-configures the dead-letter-exchange.
+            State;
+        {DLXRef, DLX, DLRKey} ->
+            Now = os:system_time(millisecond),
+            maps:fold(fun(OutSeq, #pending{last_published_at = LastPub} = Pend, S0) when LastPub + ?SETTLE_TIMEOUT =< Now ->
+                              %% Publisher confirm timed out.
+                              redeliver(Pend, DLXRef, DLX, DLRKey, OutSeq, S0);
+                         (OutSeq, #pending{last_published_at = undefined,
+                                           consumed_at = ConsumedAt} = Pend, S0) when ConsumedAt + ?SETTLE_TIMEOUT =< Now ->
+                              %% Message was never published due to dead-letter routing topology misconfiguration.
+                              redeliver(Pend, DLXRef, DLX, DLRKey, OutSeq, S0);
+                         (_OutSeq, _Pending, S) ->
+                              %% Publisher confirm did not time out (yet).
+                              S
+                      end, State, Pendings)
+    end.
 
-% name({resource, Vhost, queue, Queue}) ->
-    % <<"internal-dead-letter-", Vhost/binary, "-", Queue/binary>>.
+redeliver(#pending{content = Content} = Pend, DLXRef, DLX, _DLRKey = undefined, OldOutSeq, State) ->
+    %% No dead-letter-routing-key defined for source quorum queue.
+    %% Therefore use all of messages's original routing keys (which can include CC and BCC recipients).
+    %% This complies with the behaviour of the rabbit_dead_letter module.
+    %% We stored these original routing keys in the 1st (i.e. most recent) x-death entry.
+    #content{properties = #'P_basic'{headers = Headers}} =
+    rabbit_binary_parser:ensure_content_decoded(Content),
+    {array, [{table, MostRecentDeath}|_]} = rabbit_misc:table_lookup(Headers, <<"x-death">>),
+    {<<"routing-keys">>, array, Routes0} = lists:keyfind(<<"routing-keys">>, 1, MostRecentDeath),
+    Routes = [Route || {longstr, Route} <- Routes0],
+    redeliver0(Pend, DLXRef, DLX, Routes, OldOutSeq, State);
+redeliver(Pend, DLXRef, DLX, DLRKey, OldOutSeq, State) ->
+    redeliver0(Pend, DLXRef, DLX, [DLRKey], OldOutSeq, State).
+
+%% Quorum queues maintain their own Raft sequene number mapping to the message sequence number (= Raft correlation ID).
+%% So, they would just send us a 'settled' queue action containing the correct message sequence number.
+%%
+%% Classic queues however maintain their state by mapping the message sequence number to pending and confirmed queues.
+%% While re-using the same message sequence number could work there as well, it just gets unnecssary complicated when
+%% different target queues settle two separate deliveries referring to the same message sequence number (and same basic message).
+%%
+%% Therefore, to keep things simple, create a brand new delivery, store it in our state and forget about the old delivery and
+%% sequence number.
+%%
+%% If a sequene number gets settled after SETTLE_TIMEOUT, we can't map it anymore to the #pending{}. Hence, we ignore it.
+%%
+%% This can lead to issues when SETTLE_TIMEOUT is too low and time to settle takes too long.
+%% For example, if SETTLE_TIMEOUT is set to only 10 seconds, but settling a message takes always longer than 10 seconds
+%% (e.g. due to extremly slow hypervisor disks that ran out of credit), we will re-deliver the same message all over again
+%% leading to many duplicates in the target queue without ever acking the message back to the source discards queue.
+%%
+%% Therefore, set SETTLE_TIMEOUT reasonably high (e.g. 2 minutes).
+redeliver0(#pending{consumed_msg_id = ConsumedMsgId,
+                    content = Content,
+                    unsettled = Unsettled,
+                    settled = Settled,
+                    publish_count = PublishCount,
+                    reason = Reason} = Pend0,
+           DLXRef, DLX, DLRKeys, OldOutSeq,
+           #state{next_out_seq = OutSeq,
+                  consumer_queue_ref = CQRef,
+                  pendings = Pendings0} = State0) when is_list(DLRKeys) ->
+    BasicMsg = #basic_message{exchange_name = DLXRef,
+                              routing_keys  = DLRKeys,
+                              %% BCC Header was already stripped previously
+                              content       = Content,
+                              id            = rabbit_guid:gen(),
+                              is_persistent = rabbit_basic:is_message_persistent(Content)
+                             },
+    %% Field 'mandatory' is set to false because our module checks on its own whether the message is routable.
+    Delivery = rabbit_basic:delivery(_Mandatory = false, _Confirm = true, BasicMsg, OutSeq),
+    RouteToQs0 = rabbit_exchange:route(DLX, Delivery),
+    %% Do not re-deliver to queues for which we already received a publisher confirm.
+    RouteToQs1 = RouteToQs0 -- Settled,
+    {RouteToQs, Cycles} = rabbit_dead_letter:detect_cycles(Reason, BasicMsg, RouteToQs1),
+    Prefix = io_lib:format("Message timed out waiting on publisher confirm(s). "
+                           "Received confirm from: [~s]. "
+                           "Did not receive confirm from: [~s]. "
+                           "timeout=~bms "
+                           "message_sequence_number=~b "
+                           "consumed_message_sequence_number=~b "
+                           "publish_count=~b.",
+                           [strings(Settled), strings(Unsettled), ?SETTLE_TIMEOUT,
+                            OldOutSeq, ConsumedMsgId, PublishCount]),
+    case {RouteToQs, Cycles, Settled} of
+        {[], [], []} ->
+            rabbit_log:warning("~s Failed to re-deliver this message because no queue is bound "
+                               "to dead-letter ~s with routing keys ~p.",
+                               [Prefix, rabbit_misc:rs(DLXRef), DLRKeys]),
+            State0;
+        {[], [], [_|_]} ->
+            rabbit_log:debug("~s Routes changed dynamically so that this message does not need to be routed "
+                             "to any queue anymore. This message will be acknowledged to the source ~s.",
+                             [Prefix, rabbit_misc:rs(CQRef)]),
+            State0;
+        {[], [_|_], []} ->
+            rabbit_log:warning("~s Failed to re-deliver this message because dead-letter queue cycles "
+                               "got detected: ~p",
+                               [Prefix, Cycles]),
+            State0;
+        {[], [_|_], [_|_]} ->
+            rabbit_log:warning("~s Dead-letter queue cycles detected: ~p. "
+                               "This message will nevertheless be acknowledged to the source ~s "
+                               "because it received at least one publisher confirm.",
+                               [Prefix, Cycles, rabbit_misc:rs(CQRef)]),
+            State0;
+        _ ->
+            case Cycles of
+                [] ->
+                    rabbit_log:debug("~s Re-delivering this message to ~s",
+                                     [Prefix, strings(RouteToQs)]);
+                [_|_] ->
+                    rabbit_log:warning("~s Dead-letter queue cycles detected: ~p. "
+                                       "Re-delivering this message only to ~s",
+                                       [Prefix, Cycles, strings(RouteToQs)])
+            end,
+            Pend = Pend0#pending{publish_count = PublishCount + 1,
+                                 last_published_at = os:system_time(millisecond)},
+            Pendings1 = maps:remove(OldOutSeq, Pendings0),
+            Pendings = maps:put(OutSeq, Pend, Pendings1),
+            State = State0#state{next_out_seq = OutSeq + 1,
+                                 pendings = Pendings},
+            deliver_to_queues(Delivery, RouteToQs, State)
+    end.
 
 strings(QRefs) when is_list(QRefs) ->
     L0 = lists:map(fun rabbit_misc:rs/1, QRefs),

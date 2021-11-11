@@ -7,7 +7,7 @@
          make_settle/1]).
 
 % called by rabbit_fifo delegating DLX handling to this module
--export([init/0, apply/3, discard/2, overview/1,
+-export([init/0, apply/3, discard/3, overview/1,
          checkout/1, state_enter/4,
          start_dlx_worker/2, terminate_dlx_worker/1]).
 
@@ -22,6 +22,9 @@
 %% It also runs its own checkout logic sending DLX messages to the DLX consumer.
 %%
 %% TODO: Does it hook into the tick as well?
+%%
+%% At-least-once dead-lettering does not support reason 'maxlen'.
+-type reason() :: 'expired' | 'rejected' | delivery_limit.
 
 -record(dlx_consumer,{
           %% We don't require a consumer tag because a consumer tag is a means to distinguish
@@ -29,7 +32,8 @@
           %% creates only a single consumer to this quorum queue's discards queue.
           registered_name :: atom(),
           prefetch :: non_neg_integer(),
-          checked_out = #{} :: #{msg_id() => indexed_msg()},
+          %%TODO use ?TUPLE for memory optimisation?
+          checked_out = #{} :: #{msg_id() => {reason(), indexed_msg()}},
           next_msg_id = 0 :: msg_id() % part of snapshot data
           % total number of checked out messages - ever
           % incremented for each delivery
@@ -40,7 +44,7 @@
 -record(state,{
           consumer = undefined :: #dlx_consumer{} | undefined,
           %% Queue of dead-lettered messages.
-          discards = lqueue:new() :: lqueue:lqueue(indexed_msg()),
+          discards = lqueue:new() :: lqueue:lqueue({reason(), indexed_msg()}),
           msg_bytes = 0 :: non_neg_integer(),
           msg_bytes_checkout = 0 :: non_neg_integer()
          }).
@@ -53,7 +57,7 @@
 -record(settle, {msg_ids :: [msg_id()]}).
 -opaque protocol() :: {dlx, #checkout{} | #settle{}}.
 
--export_type([state/0, protocol/0]).
+-export_type([state/0, protocol/0, reason/0]).
 
 init() ->
     #state{}.
@@ -102,8 +106,8 @@ apply(_Meta, #checkout{consumer = RegName,
     %% were discarded.
     Checked0 = maps:to_list(CheckedOutOldConsumer),
     Checked1 = lists:keysort(1, Checked0),
-    {Discards, BytesMoved} = lists:foldr(fun({_Id, Msg}, {D, B}) ->
-                                                 {lqueue:in_r(Msg, D), B + size_in_bytes(Msg)}
+    {Discards, BytesMoved} = lists:foldr(fun({_Id, {_Reason, IdxMsg} = Msg}, {D, B}) ->
+                                                 {lqueue:in_r(Msg, D), B + size_in_bytes(IdxMsg)}
                                          end, {Discards0, 0}, Checked1),
     State = State0#state{consumer = #dlx_consumer{registered_name = RegName,
                                                   prefetch = Prefetch},
@@ -115,7 +119,7 @@ apply(_Meta, #settle{msg_ids = MsgIds},
       #state{consumer = #dlx_consumer{checked_out = Checked} = C,
              msg_bytes_checkout = BytesCheckout} = State0) ->
     Acked = maps:with(MsgIds, Checked),
-    AckedBytes = maps:fold(fun(_MsgId, Msg, Bytes) ->
+    AckedBytes = maps:fold(fun(_MsgId, {_Reason, Msg}, Bytes) ->
                                    Bytes + size_in_bytes(Msg)
                            end, 0, Acked),
     Unacked = maps:without(MsgIds, Checked),
@@ -123,9 +127,9 @@ apply(_Meta, #settle{msg_ids = MsgIds},
                          msg_bytes_checkout = BytesCheckout - AckedBytes},
     {State, Acked}.
 
-discard(Msg, #state{discards = Discards0,
-                    msg_bytes = MsgBytes0} = State) ->
-    Discards = lqueue:in(Msg, Discards0),
+discard(Msg, Reason, #state{discards = Discards0,
+                            msg_bytes = MsgBytes0} = State) ->
+    Discards = lqueue:in({Reason, Msg}, Discards0),
     MsgBytes = MsgBytes0 + size_in_bytes(Msg),
     State#state{discards = Discards,
                 msg_bytes = MsgBytes}.
@@ -142,12 +146,12 @@ checkout(#state{consumer = undefined,
 checkout(State) ->
     checkout0(checkout_one(State), {[],[]}).
 
-checkout0({success, MsgId, ?INDEX_MSG(RaftIdx, ?DISK_MSG(Header)), State}, {InMemMsgs, LogMsgs}) when is_integer(RaftIdx) ->
-    DelMsg = {RaftIdx, {MsgId, Header}},
+checkout0({success, MsgId, {Reason, ?INDEX_MSG(RaftIdx, ?DISK_MSG(Header))}, State}, {InMemMsgs, LogMsgs}) when is_integer(RaftIdx) ->
+    DelMsg = {RaftIdx, {Reason, MsgId, Header}},
     SendAcc = {InMemMsgs, [DelMsg|LogMsgs]},
     checkout0(checkout_one(State ), SendAcc);
-checkout0({success, MsgId, ?INDEX_MSG(Idx, ?MSG(Header, Msg)), State}, {InMemMsgs, LogMsgs}) when is_integer(Idx) ->
-    DelMsg = {MsgId, {Header, Msg}},
+checkout0({success, MsgId, {Reason, ?INDEX_MSG(Idx, ?MSG(Header, Msg))}, State}, {InMemMsgs, LogMsgs}) when is_integer(Idx) ->
+    DelMsg = {MsgId, {Reason, Header, Msg}},
     SendAcc = {[DelMsg|InMemMsgs], LogMsgs},
     checkout0(checkout_one(State), SendAcc);
 %TODO Is that a fallback for old message formats?
@@ -163,13 +167,13 @@ checkout_one(#state{consumer = #dlx_consumer{checked_out = Checked,
 checkout_one(#state{consumer = #dlx_consumer{checked_out = Checked0,
                                              next_msg_id = Next} = Con0} = State0) ->
     case take_next_msg(State0) of
-        {ConsumerMsg, State1} ->
-            Checked = maps:put(Next, ConsumerMsg, Checked0),
+        {{_, Msg} = ReasonMsg, State1} ->
+            Checked = maps:put(Next, ReasonMsg, Checked0),
             State2 = State1#state{consumer = Con0#dlx_consumer{checked_out = Checked,
                                                                next_msg_id = Next + 1}},
-            Bytes = size_in_bytes(ConsumerMsg),
+            Bytes = size_in_bytes(Msg),
             State = add_bytes_checkout(Bytes, State2),
-            {success, Next, ConsumerMsg, State};
+            {success, Next, ReasonMsg, State};
         empty ->
             State0
     end.
@@ -178,8 +182,8 @@ take_next_msg(#state{discards = Discards0} = State) ->
     case lqueue:out(Discards0) of
         {empty, _} ->
             empty;
-        {{value, IndexMsg}, Discards} ->
-            {IndexMsg, State#state{discards = Discards}}
+        {{value, ReasonIndexMsg}, Discards} ->
+            {ReasonIndexMsg, State#state{discards = Discards}}
     end.
 
 add_bytes_checkout(Size, #state{msg_bytes = Bytes,
@@ -201,8 +205,8 @@ delivery_effects(CPid, {InMemMsgs, IdxMsgs0}) ->
     {RaftIdxs, Data} = lists:unzip(IdxMsgs),
     [{log, RaftIdxs,
       fun(Log) ->
-              Msgs0 = lists:zipwith(fun ({enqueue, _, _, Msg}, {MsgId, Header}) ->
-                                            {MsgId, {Header, Msg}}
+              Msgs0 = lists:zipwith(fun ({enqueue, _, _, Msg}, {Reason, MsgId, Header}) ->
+                                            {MsgId, {Reason, Header, Msg}}
                                     end, Log, Data),
               Msgs = case InMemMsgs of
                          [] ->
@@ -253,5 +257,7 @@ terminate_dlx_worker(QName) ->
             rabbit_log:debug("terminated rabbit_fifo_dlx_worker (~s ~p)", [RegName, Pid])
     end.
 
+%% TODO consider not registering the worker name at all
+%% because if there is a new worker process, it will always subscribe and tell us its new pid
 registered_name(QName) when is_atom(QName) ->
     list_to_atom(atom_to_list(QName) ++ "_dlx").

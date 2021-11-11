@@ -219,7 +219,7 @@ apply(Meta, #discard{msg_ids = MsgIds, consumer_id = ConsumerId},
         #{ConsumerId := #consumer{checked_out = Checked} = Con0} ->
             case at_least_once_dlx(State0) of
                 true ->
-                    {State, ok, Effects} = discard(MsgIds, Meta, ConsumerId, Checked, [], State0),
+                    {State, ok, Effects} = discard(rejected, MsgIds, Meta, ConsumerId, Checked, [], State0),
                     checkout(Meta, State0, State, Effects, false);
                 false ->
                     % Discarded maintains same order as MsgIds (so that publishing to
@@ -1483,11 +1483,11 @@ maybe_enqueue(RaftIdx, From, MsgSeqNo, RawMsg, Effects0,
             {duplicate, State0, Effects0}
     end.
 
-discard(MsgIds, #{index := IncomingRaftIdx} = Meta, ConsumerId, Checked, Effects, State0) ->
+discard(Reason, MsgIds, #{index := IncomingRaftIdx} = Meta, ConsumerId, Checked, Effects, State0) ->
     {State1, NumDiscarded} = lists:foldl(fun(MsgId, {S0, Sum}) ->
                                                  case maps:find(MsgId, Checked) of
                                                      {ok, Msg} ->
-                                                         S = discard_one(MsgId, Msg, ConsumerId, S0),
+                                                         S = discard_one(MsgId, Msg, Reason, ConsumerId, S0),
                                                          {S, Sum+1};
                                                      error ->
                                                          {S0, Sum}
@@ -1520,6 +1520,10 @@ return(#{index := IncomingRaftIdx} = Meta, ConsumerId, Returned,
         end,
     {State, ok, Effects} = checkout(Meta, State0, State2, Effects1, false),
     update_smallest_raft_index(IncomingRaftIdx, State, Effects).
+
+%TODO in complete() pass a reason arg on why we complete
+% and then switch based on reason whether we call delete_indexes().
+% delete_indexes() should not be called if we move message to discards queue.
 
 % used to processes messages that are finished
 complete(Meta, ConsumerId, DiscardedMsgIds,
@@ -1687,7 +1691,10 @@ get_header(_Key, Header) when is_integer(Header) ->
 get_header(Key, Header) when is_map(Header) ->
     maps:get(Key, Header, undefined).
 
-discard_one(MsgId, Msg, ConsumerId, #?MODULE{consumers = Consumers,
+%%TODO can we remove discard_one function and instead call complete()
+%% because complete completes a message from a consumer.
+%% This helps later on when refactoring to call dlx for reasons other than 'rejected'.
+discard_one(MsgId, Msg, Reason, ConsumerId, #?MODULE{consumers = Consumers,
                                              dlx = DlxState0} = State0) ->
     #consumer{checked_out = Checked} = Con0 = maps:get(ConsumerId, Consumers),
     Con = Con0#consumer{checked_out = maps:remove(MsgId, Checked)},
@@ -1695,7 +1702,7 @@ discard_one(MsgId, Msg, ConsumerId, #?MODULE{consumers = Consumers,
     State1 = add_bytes_settle_or_discard(Header, State0),
     %%TODO write correct dead letter headers including reason before putting msg into discard queue
     %% see module rabbit_dead_letter
-    DlxState = rabbit_fifo_dlx:discard(Msg, DlxState0),
+    DlxState = rabbit_fifo_dlx:discard(Msg, Reason, DlxState0),
     State1#?MODULE{consumers = Consumers#{ConsumerId => Con},
                    dlx = DlxState}.
 

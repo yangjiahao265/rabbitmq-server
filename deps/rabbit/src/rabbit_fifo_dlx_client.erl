@@ -86,6 +86,6 @@ handle_delivery({delivery, [{FstId, _} | _] = IdMsgs},
 
 transform_msgs(QRes, Msgs) ->
     lists:map(
-      fun({MsgId, {_MsgHeader, Msg}}) ->
-              {QRes, MsgId, Msg}
+      fun({MsgId, {Reason, _MsgHeader, Msg}}) ->
+              {QRes, MsgId, Msg, Reason}
       end, Msgs).

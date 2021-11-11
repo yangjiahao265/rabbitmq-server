@@ -21,8 +21,8 @@ init([]) ->
     case rabbit_ff_registry:is_enabled(FeatureFlag) of
         true ->
             SupFlags = #{strategy => simple_one_for_one,
-                         intensity => 0,
-                         period => 1},
+                         intensity => 1,
+                         period => 5},
             Worker = rabbit_fifo_dlx_worker,
             ChildSpec = #{id => Worker,
                           start => {Worker, start_link, []},
