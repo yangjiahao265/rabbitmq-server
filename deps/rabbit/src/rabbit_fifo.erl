@@ -1258,6 +1258,8 @@ apply_enqueue(#{index := RaftIdx} = Meta, From, Seq, RawMsg, State0) ->
             {maybe_store_dehydrated_state(RaftIdx, State), ok, Effects};
         {duplicate, State, Effects} ->
             {State, ok, Effects}
+        {dropped, State, Effects} ->
+            {State, out_of_sequence, Effects}
     end.
 
 decr_total(#?MODULE{messages_total = Tot} = State) ->
@@ -1376,17 +1378,15 @@ maybe_enqueue(RaftIdx, From, MsgSeqNo, RawMsg, Effects0,
             Enq = Enq0#enqueuer{next_seqno = MsgSeqNo + 1},
             State = enqueue_pending(From, Enq, State1),
             {ok, State, Effects0};
-        #enqueuer{next_seqno = Next,
-                  pending = Pending0} = Enq0
+        #enqueuer{next_seqno = Next} = Enq0
           when MsgSeqNo > Next ->
             % out of order delivery
-            Pending = [{MsgSeqNo, RaftIdx, RawMsg} | Pending0],
-            Enq = Enq0#enqueuer{pending = lists:sort(Pending)},
-            %% if the enqueue it out of order we need to mark it in the
-            %% index
-            Indexes = rabbit_fifo_index:append(RaftIdx, Indexes0),
-            {ok, State0#?MODULE{enqueuers = Enqueuers0#{From => Enq},
-                                ra_indexes = Indexes}, Effects0};
+            % Pending = [{MsgSeqNo, RaftIdx, RawMsg} | Pending0],
+            % Enq = Enq0#enqueuer{pending = lists:sort(Pending)},
+            % %% if the enqueue it out of order we need to mark it in the
+            % %% index
+            % Indexes = rabbit_fifo_index:append(RaftIdx, Indexes0),
+            {dropped, State0#?MODULE{}, Effects0};
         #enqueuer{next_seqno = Next} when MsgSeqNo =< Next ->
             % duplicate delivery - remove the raft index from the ra_indexes
             % map as it was added earlier
