@@ -555,7 +555,7 @@ apply(#{index := Idx} = Meta, #update_config{config = Conf}, State0) ->
     update_smallest_raft_index(Idx, Reply, State, Effects);
 apply(_Meta, {machine_version, FromVersion, ToVersion}, V0State) ->
     State = convert(FromVersion, ToVersion, V0State),
-    {State, ok, []};
+    {State, ok, [{aux, start_dlx_worker}]};
 %%TODO are there better approach to
 %% 1. matching against opaque rabbit_fifo_dlx:protocol / record (without exposing all the protocol details), and
 %% 2. Separate the logic running in rabbit_fifo and rabbit_fifo_dlx when dead-letter messages is acked?
@@ -995,8 +995,15 @@ handle_aux(_RaState, {call, _From}, {peek, Pos}, Aux0,
            {reply, {ok, {Header, Msg}}, Aux0, Log0};
         Err ->
             {reply, Err, Aux0, Log0}
-    end.
-
+    end;
+handle_aux(leader, _, start_dlx_worker, Aux, Log,
+           #?MODULE{cfg = #cfg{resource = QRef,
+                               name = QName,
+                               dead_letter_handler = {at_least_once, _}}}) ->
+    rabbit_fifo_dlx:start_dlx_worker(QRef, QName),
+    {no_reply, Aux, Log};
+handle_aux(_, _, start_dlx_worker, Aux, Log, _) ->
+    {no_reply, Aux, Log}.
 
 eval_gc(Log, #?MODULE{cfg = #cfg{resource = QR}} = MacState,
         #aux{gc = #aux_gc{last_raft_idx = LastGcIdx} = Gc} = AuxState) ->
@@ -2416,48 +2423,7 @@ convert(To, To, State0) ->
 convert(0, To, State0) ->
     convert(1, To, rabbit_fifo_v1:convert_v0_to_v1(State0));
 convert(1, To, State0) ->
-    #?MODULE{cfg = #cfg{resource = QRef,
-                        name = QName,
-                        dead_letter_handler = DLH}} = State = convert_v1_to_v2(State0),
-    %% When (re)starting the Ra node, rabbit_fifo_v0:init/1 is run.
-    %% During Ra node start up, state_enter/2 callbacks are called on the old rabbit_fifo modules, not on this (new) module.
-    %% Once the Ra machine version is converted to this (new) module, we neeed to start the rabbit_fifo_dlx_worker if
-    %% we are the leader.
-    %%
-    %% How do we know in this convert/3 function whether we're the leader?
-    %%
-    %% Option 1 (the one we go for):
-    %% The easiest way to determine our Ra state is by looking into ra_state ETS module where the Ra state is updated
-    %% onto every gen_statem state_enter call (see https://github.com/rabbitmq/ra/blob/d8b3c83be965584d300d616836b70806b2821989/src/ra_server_proc.erl#L953).
-    %%
-    %% Option 2:
-    %% {ok, Q} = rabbit_amqqueue:lookup(QRef)
-    %% followed by
-    %% rabbit_quorum_queue:info(Q, [leader])
-    %% does not seem to be reliable because
-    %% 1. lookup sometimes returns an error not_found, and
-    %% 2. it returns stale information after Ra node restart (saying we're the leader although we'ree not).
-    %%
-    %% Option 3:
-    %% {status, _Pid, {module, _Mod}, [_PDict, _SysState, _Parent, _Dbg, Misc]} = sys:get_status(QName),
-    %% proplists:get_value(raft_state, Misc)
-    %% returns the Ra state as well. However, it will result in a dead-lock if we call it here.
-    %%
-    %% Option 4:
-    %% Make the Ra state part of the machine state.
-    %% It would be confusing to do so since different Ra nodes in the same cluster will end up with different machine states.
-    %%
-    %% TODO Are there better options to Option 1?
-    RaState = ets:lookup_element(ra_state, QName, 2),
-    case {DLH, RaState} of
-        {{at_least_once, _}, leader} ->
-            rabbit_fifo_dlx:start_dlx_worker(QRef, QName);
-        {{at_least_once, _}, _} ->
-            rabbit_fifo_dlx:terminate_dlx_worker(QName);
-        _ ->
-            ok
-    end,
-    convert(2, To, State).
+    convert(2, To, convert_v1_to_v2(State0)).
 
 smallest_raft_index(#?MODULE{cfg = _Cfg,
                              messages = Messages,
