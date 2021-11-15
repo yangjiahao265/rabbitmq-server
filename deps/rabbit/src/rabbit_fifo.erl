@@ -214,14 +214,15 @@ apply(Meta,
 
     end;
 apply(Meta, #discard{msg_ids = MsgIds, consumer_id = ConsumerId},
-      #?MODULE{consumers = Cons0} = State0) ->
+      #?MODULE{consumers = Cons0,
+               cfg = #cfg{dead_letter_handler = DLH}} = State0) ->
     case Cons0 of
         #{ConsumerId := #consumer{checked_out = Checked} = Con0} ->
-            case at_least_once_dlx(State0) of
-                true ->
+            case DLH of
+                at_least_once ->
                     {State, ok, Effects} = discard(rejected, MsgIds, Meta, ConsumerId, Checked, [], State0),
                     checkout(Meta, State0, State, Effects, false);
-                false ->
+                _ ->
                     % Discarded maintains same order as MsgIds (so that publishing to
                     % dead-letter exchange will be in same order as messages got rejected)
                     Discarded = lists:filtermap(fun(Id) ->
@@ -551,11 +552,24 @@ apply(#{index := Idx} = Meta, #purge_nodes{nodes = Nodes}, State0) ->
                                    end, {State0, []}, Nodes),
     update_smallest_raft_index(Idx, ok, State, Effects);
 apply(#{index := Idx} = Meta, #update_config{config = Conf}, State0) ->
-    {State, Reply, Effects} = checkout(Meta, State0, update_config(Conf, State0), []),
+    {#?MODULE{cfg = #cfg{dead_letter_handler = DLH},
+              dlx = DlxState} = State, Reply, Effects0} =
+    checkout(Meta, State0, update_config(Conf, State0), [{aux, dlx_worker}]),
+    Effects = case DLH of
+                  at_least_once ->
+                      case rabbit_fifo_dlx:consumer_pid(DlxState) of
+                          undefined ->
+                              Effects0;
+                          DlxWorkerPid ->
+                              [{send_msg, DlxWorkerPid, lookup_topology, ra_event} | Effects0]
+                      end;
+                  _ ->
+                      Effects0
+              end,
     update_smallest_raft_index(Idx, Reply, State, Effects);
 apply(_Meta, {machine_version, FromVersion, ToVersion}, V0State) ->
     State = convert(FromVersion, ToVersion, V0State),
-    {State, ok, [{aux, start_dlx_worker}]};
+    {State, ok, [{aux, dlx_worker}]};
 %%TODO are there better approach to
 %% 1. matching against opaque rabbit_fifo_dlx:protocol / record (without exposing all the protocol details), and
 %% 2. Separate the logic running in rabbit_fifo and rabbit_fifo_dlx when dead-letter messages is acked?
@@ -670,27 +684,23 @@ convert_v1_to_v2(V1State) ->
                     end, ConsumersV1),
 
     %% The (old) format of dead_letter_handler in RMQ < v3.10 is:
-    %%   undefined | {Module, Function, Args}
+    %%   {Module, Function, Args}
     %% The (new) format of dead_letter_handler in RMQ >= v3.10 is:
-    %%   undefined | {at_least_once | at_most_once, {Module, Function, Args}}
+    %%   undefined | {at_most_once, {Module, Function, Args}} | at_least_once
     %%
     %% Note that the conversion must convert both from old format to new format
     %% as well as from new format to new format. The latter is because quorum queues
     %% created in RMQ >= v3.10 are still initialised with rabbit_fifo_v0 as described in
     %% https://github.com/rabbitmq/ra/blob/e0d1e6315a45f5d3c19875d66f9d7bfaf83a46e3/src/ra_machine.erl#L258-L265
     DLH = case rabbit_fifo_v1:get_cfg_field(dead_letter_handler, V1State) of
-              undefined ->
-                  undefined;
-              {_M, _F, _Args = [_DLX = undefined|_]} ->
+              {_M, _F, _A = [_DLX = undefined|_]} ->
                   %% queue was declared in RMQ < v3.10 and no DLX configured
                   undefined;
-              {_M, _F, _Args} = MFA ->
+              {_M, _F, _A} = MFA ->
                   %% queue was declared in RMQ < v3.10 and DLX configured
-                  %% handler gets converted to new default at_least_once
-                  {at_least_once, MFA};
-              {_Strategy, _MFA} = StrategyMFA ->
-                  %% queue was declared in RMQ >= v3.10 and DLX configured
-                  StrategyMFA
+                  {at_most_once, MFA};
+              Other ->
+                  Other
           end,
 
     %% Then add all pending messages back into the index
@@ -804,15 +814,13 @@ update_waiting_consumer_status(Node,
      Consumer#consumer.status =/= cancelled].
 
 -spec state_enter(ra_server:ra_state(), state()) -> ra_machine:effects().
-state_enter(RaState, #?MODULE{cfg = #cfg{resource = QRef,
+state_enter(RaState, #?MODULE{cfg = #cfg{dead_letter_handler = at_least_once,
+                                         resource = QRef,
                                          name = QName},
                               dlx = DlxState} = State) ->
-    case at_least_once_dlx(State) of
-        true ->
-            rabbit_fifo_dlx:state_enter(RaState, QRef, QName, DlxState);
-        false ->
-            ok
-    end,
+    rabbit_fifo_dlx:state_enter(RaState, QRef, QName, DlxState),
+    state_enter0(RaState, State);
+state_enter(RaState, State) ->
     state_enter0(RaState, State).
 
 state_enter0(leader, #?MODULE{consumers = Cons,
@@ -996,13 +1004,20 @@ handle_aux(_RaState, {call, _From}, {peek, Pos}, Aux0,
         Err ->
             {reply, Err, Aux0, Log0}
     end;
-handle_aux(leader, _, start_dlx_worker, Aux, Log,
+handle_aux(leader, _, dlx_worker, Aux, Log,
            #?MODULE{cfg = #cfg{resource = QRef,
                                name = QName,
-                               dead_letter_handler = {at_least_once, _}}}) ->
+                               dead_letter_handler = at_least_once}}) ->
     rabbit_fifo_dlx:start_dlx_worker(QRef, QName),
     {no_reply, Aux, Log};
-handle_aux(_, _, start_dlx_worker, Aux, Log, _) ->
+handle_aux(leader, _, dlx_worker, Aux, Log, #?MODULE{cfg = #cfg{name = QName}}) ->
+    %%TODO when changing policies from at-least-once to at-most-once (or indirectly via overflow from
+    %% reject-publish to drop-head, terminating the dlx worker is not enough. We need to at-most-once
+    %% dead-letter all messages in the discards queue (not necessarily to deliver the messages, but to
+    %% allow for Raft log truncation).
+    rabbit_fifo_dlx:terminate_dlx_worker(QName),
+    {no_reply, Aux, Log};
+handle_aux(_, _, dlx_worker, Aux, Log, _) ->
     {no_reply, Aux, Log}.
 
 eval_gc(Log, #?MODULE{cfg = #cfg{resource = QR}} = MacState,
@@ -1378,8 +1393,6 @@ drop_head(#?MODULE{ra_indexes = Indexes0} = State0, Effects0) ->
                         _ ->
                             subtract_in_memory_counts(Header, State2)
                     end,
-            %% For overflow strategy drop-head, dead-lettering will be at-most-once
-            %% even if at-least-once configured.
             Effects = dead_letter_effects(maxlen, [FullMsg],
                                           State, Effects0),
             {State#?MODULE{ra_indexes = Indexes}, Effects};
@@ -1584,7 +1597,7 @@ dead_letter_effects(_Reason, _Discarded,
                     Effects) ->
     Effects;
 dead_letter_effects(Reason, Discarded,
-                    #?MODULE{cfg = #cfg{dead_letter_handler = {_Strategy, {Mod, Fun, Args}}}},
+                    #?MODULE{cfg = #cfg{dead_letter_handler = {at_most_once, {Mod, Fun, Args}}}},
                     Effects) ->
     RaftIdxs = lists:filtermap(
                  fun (?INDEX_MSG(RaftIdx, ?DISK_MSG(_Header))) ->
@@ -2446,8 +2459,3 @@ smallest_raft_index(#?MODULE{cfg = _Cfg,
                     {undefined, State}
             end
     end.
-
-at_least_once_dlx(#?MODULE{cfg = #cfg{dead_letter_handler = {at_least_once, _}}}) ->
-    true;
-at_least_once_dlx(_) ->
-    false.

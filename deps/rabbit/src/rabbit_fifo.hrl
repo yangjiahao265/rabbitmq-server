@@ -137,7 +137,7 @@
         {name :: atom(),
          resource :: rabbit_types:r('queue'),
          release_cursor_interval :: option({non_neg_integer(), non_neg_integer()}),
-         dead_letter_handler :: option({at_least_once | at_most_least, applied_mfa()}),
+         dead_letter_handler :: option({at_most_once, applied_mfa()} | at_least_once),
          become_leader_handler :: option(applied_mfa()),
          overflow_strategy = drop_head :: drop_head | reject_publish,
          max_length :: option(non_neg_integer()),
@@ -210,7 +210,7 @@
 
 -type config() :: #{name := atom(),
                     queue_resource := rabbit_types:r('queue'),
-                    dead_letter_handler => option({at_least_once | at_most_least, applied_mfa()}),
+                    dead_letter_handler => option({at_most_once, applied_mfa()} | at_least_once),
                     become_leader_handler => applied_mfa(),
                     release_cursor_interval => non_neg_integer(),
                     max_length => non_neg_integer(),

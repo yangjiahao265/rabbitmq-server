@@ -9,7 +9,8 @@
 % called by rabbit_fifo delegating DLX handling to this module
 -export([init/0, apply/3, discard/3, overview/1,
          checkout/1, state_enter/4,
-         start_dlx_worker/2, terminate_dlx_worker/1]).
+         start_dlx_worker/2, terminate_dlx_worker/1,
+         consumer_pid/1]).
 
 %% This module handles the dead letter (DLX) part of the rabbit_fifo state machine.
 %% This is a separate module to better unit test and provide separation of concerns.
@@ -243,7 +244,7 @@ start_dlx_worker(QRef, QName) ->
             {ok, Pid} = supervisor:start_child(rabbit_fifo_dlx_sup, [QRef, RegName]),
             rabbit_log:debug("started rabbit_fifo_dlx_worker (~s ~p)", [RegName, Pid]);
         Pid ->
-            rabbit_log:info("rabbit_fifo_dlx_worker (~s ~p) already started", [RegName, Pid])
+            rabbit_log:debug("rabbit_fifo_dlx_worker (~s ~p) already started", [RegName, Pid])
     end.
 
 terminate_dlx_worker(QName) ->
@@ -261,3 +262,8 @@ terminate_dlx_worker(QName) ->
 %% because if there is a new worker process, it will always subscribe and tell us its new pid
 registered_name(QName) when is_atom(QName) ->
     list_to_atom(atom_to_list(QName) ++ "_dlx").
+
+consumer_pid(#state{consumer = #dlx_consumer{registered_name = Name}}) ->
+    whereis(Name);
+consumer_pid(_) ->
+    undefined.

@@ -926,35 +926,35 @@ check_dlxname_arg(Val, _) when is_list(Val) or is_binary(Val) -> ok;
 check_dlxname_arg(_Val, _) -> {error, {unacceptable_type, "expected a string (valid exchange name)"}}.
 
 check_dlxrk_arg({longstr, _}, Args) ->
-    ensure_dead_letter_exchange(Args, routing_key_but_no_dlx_defined);
+    case rabbit_misc:table_lookup(Args, <<"x-dead-letter-exchange">>) of
+        undefined -> {error, routing_key_but_no_dlx_defined};
+        _         -> ok
+    end;
 check_dlxrk_arg({Type,    _}, _Args) ->
     {error, {unacceptable_type, Type}};
 check_dlxrk_arg(Val, Args) when is_binary(Val) ->
-    ensure_dead_letter_exchange(Args, routing_key_but_no_dlx_defined);
+    case rabbit_misc:table_lookup(Args, <<"x-dead-letter-exchange">>) of
+        undefined -> {error, routing_key_but_no_dlx_defined};
+        _         -> ok
+    end;
 check_dlxrk_arg(_Val, _Args) ->
     {error, {unacceptable_type, "expected a string"}}.
 
--define(KNOWN_DLX_STRATEGIES, [<<"at-least-once">>, <<"at-most-once">>]).
-check_dlxstrategy_arg({longstr, Val}, Args) ->
+-define(KNOWN_DLX_STRATEGIES, [<<"at-most-once">>, <<"at-least-once">>]).
+check_dlxstrategy_arg({longstr, Val}, _Args) ->
     case lists:member(Val, ?KNOWN_DLX_STRATEGIES) of
-        true -> ensure_dead_letter_exchange(Args, dlx_strategy_but_no_dlx_defined);
+        true -> ok;
         false -> {error, invalid_dlx_strategy}
     end;
-check_dlxstrategy_arg({Type,    _}, _Args) ->
+check_dlxstrategy_arg({Type, _}, _Args) ->
     {error, {unacceptable_type, Type}};
-check_dlxstrategy_arg(Val, Args) when is_binary(Val) ->
+check_dlxstrategy_arg(Val, _Args) when is_binary(Val) ->
     case lists:member(Val, ?KNOWN_DLX_STRATEGIES) of
-        true -> ensure_dead_letter_exchange(Args, dlx_strategy_but_no_dlx_defined);
+        true -> ok;
         false -> {error, invalid_dlx_strategy}
     end;
 check_dlxstrategy_arg(_Val, _Args) ->
     {error, invalid_dlx_strategy}.
-
-ensure_dead_letter_exchange(Args, Error) ->
-    case rabbit_misc:table_lookup(Args, <<"x-dead-letter-exchange">>) of
-        undefined -> {error, Error};
-        _         -> ok
-    end.
 
 -define(KNOWN_OVERFLOW_MODES, [<<"drop-head">>, <<"reject-publish">>, <<"reject-publish-dlx">>]).
 check_overflow({longstr, Val}, _Args) ->

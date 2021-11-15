@@ -227,21 +227,16 @@ ra_machine_config(Q) when ?is_amqqueue(Q) ->
     {Name, _} = amqqueue:get_pid(Q),
     %% take the minimum value of the policy and the queue arg if present
     MaxLength = args_policy_lookup(<<"max-length">>, fun min/2, Q),
-    %% prefer the policy defined strategy if available
-    Overflow = args_policy_lookup(<<"overflow">>, fun (A, _B) -> A end , Q),
+    OverflowBin = args_policy_lookup(<<"overflow">>, fun policyHasPrecedence/2, Q),
+    Overflow = overflow(OverflowBin, drop_head, QName),
     MaxBytes = args_policy_lookup(<<"max-length-bytes">>, fun min/2, Q),
     MaxMemoryLength = args_policy_lookup(<<"max-in-memory-length">>, fun min/2, Q),
     MaxMemoryBytes = args_policy_lookup(<<"max-in-memory-bytes">>, fun min/2, Q),
     DeliveryLimit = args_policy_lookup(<<"delivery-limit">>, fun min/2, Q),
-    Expires = args_policy_lookup(<<"expires">>,
-                                 fun (A, _B) -> A end,
-                                 Q),
-    DeadLetterStrategy = args_policy_lookup(<<"dead-letter-strategy">>,
-                                            fun (A, _B) -> A end,
-                                            Q),
+    Expires = args_policy_lookup(<<"expires">>, fun policyHasPrecedence/2, Q),
     #{name => Name,
       queue_resource => QName,
-      dead_letter_handler => dead_letter_handler(DeadLetterStrategy, Q),
+      dead_letter_handler => dead_letter_handler(Q, Overflow),
       become_leader_handler => {?MODULE, become_leader, [QName]},
       max_length => MaxLength,
       max_bytes => MaxBytes,
@@ -249,10 +244,13 @@ ra_machine_config(Q) when ?is_amqqueue(Q) ->
       max_in_memory_bytes => MaxMemoryBytes,
       single_active_consumer_on => single_active_consumer_on(Q),
       delivery_limit => DeliveryLimit,
-      overflow_strategy => overflow(Overflow, drop_head, QName),
+      overflow_strategy => Overflow,
       created => erlang:system_time(millisecond),
       expires => Expires
      }.
+
+policyHasPrecedence(Policy, _QueueArg) ->
+    Policy.
 
 single_active_consumer_on(Q) ->
     QArguments = amqqueue:get_arguments(Q),
@@ -1242,32 +1240,44 @@ reclaim_memory(Vhost, QueueName) ->
     ra_log_wal:force_roll_over({?RA_WAL_NAME, Node}).
 
 %%----------------------------------------------------------------------------
-dead_letter_handler(Stategy, Q) ->
-    DLXName = args_policy_lookup(<<"dead-letter-exchange">>, fun res_arg/2, Q),
-    case init_dlx(DLXName, Q) of
-        undefined ->
-            undefined;
-        DLX ->
-            DLXRKey = args_policy_lookup(<<"dead-letter-routing-key">>, fun res_arg/2, Q),
-            MFA = {?MODULE, dead_letter_publish, [DLX, DLXRKey, amqqueue:get_name(Q)]},
-            dead_letter_handler0(Stategy, MFA)
-    end.
-
-init_dlx(undefined, _Q) ->
-    undefined;
-init_dlx(DLX, Q) when ?is_amqqueue(Q) ->
+dead_letter_handler(Q, Overflow) ->
+    %%TODO policy having precedence is a behaviour change. Check if that's okay.
+    %% Policy needs to have precedence for at-least-once to allow to dynamically
+    %% fix dead-letter routing topologies for a queue.
+    Exchange = args_policy_lookup(<<"dead-letter-exchange">>, fun policyHasPrecedence/2, Q),
+    RoutingKey = args_policy_lookup(<<"dead-letter-routing-key">>, fun policyHasPrecedence/2, Q),
+    Strategy = args_policy_lookup(<<"dead-letter-strategy">>, fun policyHasPrecedence/2, Q),
     QName = amqqueue:get_name(Q),
-    rabbit_misc:r(QName, exchange, DLX).
+    dlh(Exchange, RoutingKey, Strategy, Overflow, QName).
 
-%% For at-least-once, we still need the at-most-once semantics provided by MFA for overflow strategy drop_head.
-dead_letter_handler0(undefined, MFA) ->
-    {at_least_once, MFA};
-dead_letter_handler0(<<"at-least-once">>, MFA) ->
-    {at_least_once, MFA};
-dead_letter_handler0(<<"at-most-once">>, MFA) ->
+dlh(undefined, undefined, undefined, _, _) ->
+    undefined;
+dlh(undefined, RoutingKey, undefined, _, QName) ->
+    rabbit_log:warning("Disabling dead-lettering for ~s despite configured dead-letter-routing-key '~s' "
+                       "because dead-letter-exchange is not configured.",
+                       [rabbit_misc:rs(QName), RoutingKey]),
+    undefined;
+dlh(undefined, _, Strategy, _, QName) ->
+    rabbit_log:warning("Disabling dead-lettering for ~s despite configured dead-letter-strategy '~s' "
+                       "because dead-letter-exchange is not configured.",
+                       [rabbit_misc:rs(QName), Strategy]),
+    undefined;
+dlh(_, _, <<"at-least-once">>, reject_publish, _) ->
+    at_least_once;
+dlh(Exchange, RoutingKey, <<"at-least-once">>, drop_head, QName) ->
+    rabbit_log:warning("Falling back to dead-letter-strategy at-most-once for ~s "
+                       "because configured dead-letter-strategy at-least-once is incompatible with "
+                       "effective overflow strategy drop-head. To enable dead-letter-strategy "
+                       "at-least-once, set overflow strategy to reject-publish.",
+                       [rabbit_misc:rs(QName)]),
+    dlh_at_most_once(Exchange, RoutingKey, QName);
+dlh(Exchange, RoutingKey, _, _, QName) ->
+    dlh_at_most_once(Exchange, RoutingKey, QName).
+
+dlh_at_most_once(Exchange, RoutingKey, QName) ->
+    DLX = rabbit_misc:r(QName, exchange, Exchange),
+    MFA = {?MODULE, dead_letter_publish, [DLX, RoutingKey, QName]},
     {at_most_once, MFA}.
-
-res_arg(_PolVal, ArgVal) -> ArgVal.
 
 dead_letter_publish(undefined, _, _, _) ->
     ok;
