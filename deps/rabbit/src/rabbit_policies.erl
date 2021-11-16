@@ -85,8 +85,9 @@ validate_policy0(<<"dead-letter-routing-key">>, Value)
 validate_policy0(<<"dead-letter-routing-key">>, Value) ->
     {error, "~p is not a valid dead letter routing key", [Value]};
 
-validate_policy0(<<"dead-letter-strategy">>, Value)
-  when is_binary(Value) ->
+validate_policy0(<<"dead-letter-strategy">>, <<"at-most-once">>) ->
+    ok;
+validate_policy0(<<"dead-letter-strategy">>, <<"at-least-once">>) ->
     ok;
 validate_policy0(<<"dead-letter-strategy">>, Value) ->
     {error, "~p is not a valid dead letter strategy", [Value]};

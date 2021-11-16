@@ -27,6 +27,8 @@
 %% At-least-once dead-lettering does not support reason 'maxlen'.
 -type reason() :: 'expired' | 'rejected' | delivery_limit.
 
+%%TODO Add logic to rabbit_fifo_dlx to dehydrate the state.
+% See snapshot scenarios in rabbit_fifo_prop_SUITE. Add dlx dehydrate tests.
 -record(dlx_consumer,{
           %% We don't require a consumer tag because a consumer tag is a means to distinguish
           %% multiple consumers in the same channel. The rabbit_fifo_dlx_worker channel like process however

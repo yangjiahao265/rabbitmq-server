@@ -1720,8 +1720,6 @@ discard_one(MsgId, Msg, Reason, ConsumerId, #?MODULE{consumers = Consumers,
     Con = Con0#consumer{checked_out = maps:remove(MsgId, Checked)},
     Header = get_msg_header(Msg),
     State1 = add_bytes_settle_or_discard(Header, State0),
-    %%TODO write correct dead letter headers including reason before putting msg into discard queue
-    %% see module rabbit_dead_letter
     DlxState = rabbit_fifo_dlx:discard(Msg, Reason, DlxState0),
     State1#?MODULE{consumers = Consumers#{ConsumerId => Con},
                    dlx = DlxState}.
