@@ -7,7 +7,7 @@
          make_settle/1]).
 
 % called by rabbit_fifo delegating DLX handling to this module
--export([init/0, apply/3, discard/3, overview/1,
+-export([init/0, apply/2, discard/3, overview/1,
          checkout/1, state_enter/4,
          start_dlx_worker/2, terminate_dlx_worker/1,
          consumer_pid/1]).
@@ -90,14 +90,14 @@ overview0(Discards, Checked, MsgBytes, MsgBytesCheckout) ->
       discard_message_bytes => MsgBytes,
       discard_checkout_message_bytes => MsgBytesCheckout}.
 
-apply(_Meta, #checkout{consumer = RegName,
-                       prefetch = Prefetch},
+apply(#checkout{consumer = RegName,
+                prefetch = Prefetch},
       #state{consumer = undefined} = State0) ->
     State = State0#state{consumer = #dlx_consumer{registered_name = RegName,
                                                   prefetch = Prefetch}},
-    {State, ok, []};
-apply(_Meta, #checkout{consumer = RegName,
-                       prefetch = Prefetch},
+    {State, ok};
+apply(#checkout{consumer = RegName,
+                prefetch = Prefetch},
       #state{consumer = #dlx_consumer{checked_out = CheckedOutOldConsumer},
              discards = Discards0,
              msg_bytes = Bytes,
@@ -117,8 +117,8 @@ apply(_Meta, #checkout{consumer = RegName,
                          discards = Discards,
                          msg_bytes = Bytes + BytesMoved,
                          msg_bytes_checkout = BytesCheckout - BytesMoved},
-    {State, ok, []};
-apply(_Meta, #settle{msg_ids = MsgIds},
+    {State, ok};
+apply(#settle{msg_ids = MsgIds},
       #state{consumer = #dlx_consumer{checked_out = Checked} = C,
              msg_bytes_checkout = BytesCheckout} = State0) ->
     Acked = maps:with(MsgIds, Checked),

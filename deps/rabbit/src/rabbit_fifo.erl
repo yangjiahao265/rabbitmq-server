@@ -208,20 +208,29 @@ apply(Meta,
     case Cons0 of
         #{ConsumerId := Con0} ->
             complete_and_checkout(Meta, MsgIds, ConsumerId,
-                                  Con0, [], State);
+                                  Con0, [], State, true);
         _ ->
             {State, ok}
 
     end;
 apply(Meta, #discard{msg_ids = MsgIds, consumer_id = ConsumerId},
-      #?MODULE{consumers = Cons0,
-               cfg = #cfg{dead_letter_handler = DLH}} = State0) ->
-    case Cons0 of
-        #{ConsumerId := #consumer{checked_out = Checked} = Con0} ->
+      #?MODULE{consumers = Cons,
+               dlx = DlxState0,
+               cfg = #cfg{dead_letter_handler = DLH}} = State) ->
+    case Cons of
+        #{ConsumerId := #consumer{checked_out = Checked} = Con} ->
             case DLH of
                 at_least_once ->
-                    {State, ok, Effects} = discard(rejected, MsgIds, Meta, ConsumerId, Checked, [], State0),
-                    checkout(Meta, State0, State, Effects, false);
+                    DlxState = lists:foldl(fun(MsgId, S) ->
+                                                   case maps:find(MsgId, Checked) of
+                                                       {ok, Msg} ->
+                                                           rabbit_fifo_dlx:discard(Msg, rejected, S);
+                                                       error ->
+                                                           S
+                                                   end
+                                           end, DlxState0, MsgIds),
+                    complete_and_checkout(Meta, MsgIds, ConsumerId, Con,
+                                          [], State#?MODULE{dlx = DlxState}, false);
                 _ ->
                     % Discarded maintains same order as MsgIds (so that publishing to
                     % dead-letter exchange will be in same order as messages got rejected)
@@ -233,12 +242,12 @@ apply(Meta, #discard{msg_ids = MsgIds, consumer_id = ConsumerId},
                                                                 false
                                                         end
                                                 end, MsgIds),
-                    Effects = dead_letter_effects(rejected, Discarded, State0, []),
-                    complete_and_checkout(Meta, MsgIds, ConsumerId, Con0,
-                                          Effects, State0)
+                    Effects = dead_letter_effects(rejected, Discarded, State, []),
+                    complete_and_checkout(Meta, MsgIds, ConsumerId, Con,
+                                          Effects, State, true)
             end;
         _ ->
-            {State0, ok}
+            {State, ok}
     end;
 apply(Meta, #return{msg_ids = MsgIds, consumer_id = ConsumerId},
       #?MODULE{consumers = Cons0} = State) ->
@@ -577,7 +586,7 @@ apply(#{index := IncomingRaftIdx} = Meta, {dlx, Cmd},
       #?MODULE{dlx = DlxState0,
                messages_total = Total0,
                ra_indexes = Indexes0} = State0) when element(1, Cmd) =:= settle ->
-    {DlxState, Acked} = rabbit_fifo_dlx:apply(Meta, Cmd, DlxState0),
+    {DlxState, Acked} = rabbit_fifo_dlx:apply(Cmd, DlxState0),
     Indexes = delete_indexes(Acked, Indexes0),
     Total = Total0 - map_size(Acked),
     State1 = State0#?MODULE{dlx = DlxState,
@@ -587,11 +596,11 @@ apply(#{index := IncomingRaftIdx} = Meta, {dlx, Cmd},
     update_smallest_raft_index(IncomingRaftIdx, State, Effects);
 apply(#{index := IncomingRaftIdx} = Meta, {dlx, Cmd},
       #?MODULE{dlx = DlxState0} = State0) ->
-    {DlxState, ok, Effects0} = rabbit_fifo_dlx:apply(Meta, Cmd, DlxState0),
+    {DlxState, ok} = rabbit_fifo_dlx:apply(Cmd, DlxState0),
     State1 = State0#?MODULE{dlx = DlxState},
     %% Run a checkout so that a new DLX consumer will be delivered discarded messages
     %% directly after it subscribes.
-    {State, ok, Effects} = checkout(Meta, State0, State1, Effects0, false),
+    {State, ok, Effects} = checkout(Meta, State0, State1, [], false),
     update_smallest_raft_index(IncomingRaftIdx, State, Effects);
 apply(_Meta, Cmd, State) ->
     %% handle unhandled commands gracefully
@@ -1503,26 +1512,6 @@ maybe_enqueue(RaftIdx, From, MsgSeqNo, RawMsg, Effects0,
             {duplicate, State0, Effects0}
     end.
 
-discard(Reason, MsgIds, #{index := IncomingRaftIdx} = Meta, ConsumerId, Checked, Effects, State0) ->
-    {State1, NumDiscarded} = lists:foldl(fun(MsgId, {S0, Sum}) ->
-                                                 case maps:find(MsgId, Checked) of
-                                                     {ok, Msg} ->
-                                                         S = discard_one(MsgId, Msg, Reason, ConsumerId, S0),
-                                                         {S, Sum+1};
-                                                     error ->
-                                                         {S0, Sum}
-                                                 end
-                                         end, {State0, 0}, MsgIds),
-    State = case State1#?MODULE.consumers of
-                #{ConsumerId := Con0} ->
-                    Con = Con0#consumer{credit = increase_credit(Con0,
-                                                                 NumDiscarded)},
-                    update_or_remove_sub(Meta, ConsumerId, Con, State1);
-                _ ->
-                    State1
-            end,
-    update_smallest_raft_index(IncomingRaftIdx, State, Effects).
-
 return(#{index := IncomingRaftIdx} = Meta, ConsumerId, Returned,
        Effects0, State0) ->
     {State1, Effects1} = maps:fold(
@@ -1541,28 +1530,29 @@ return(#{index := IncomingRaftIdx} = Meta, ConsumerId, Returned,
     {State, ok, Effects} = checkout(Meta, State0, State2, Effects1, false),
     update_smallest_raft_index(IncomingRaftIdx, State, Effects).
 
-%TODO in complete() pass a reason arg on why we complete
-% and then switch based on reason whether we call delete_indexes().
-% delete_indexes() should not be called if we move message to discards queue.
-
 % used to processes messages that are finished
 complete(Meta, ConsumerId, DiscardedMsgIds,
-         #consumer{checked_out = Checked} = Con0, Effects,
+         #consumer{checked_out = Checked} = Con0,
          #?MODULE{messages_total = Tot,
-                  ra_indexes = Indexes0} = State0) ->
+                  ra_indexes = Indexes0} = State0, Delete) ->
     %% credit_mode = simple_prefetch should automatically top-up credit
     %% as messages are simple_prefetch or otherwise returned
     Discarded = maps:with(DiscardedMsgIds, Checked),
     Con = Con0#consumer{checked_out = maps:without(DiscardedMsgIds, Checked),
                         credit = increase_credit(Con0, map_size(Discarded))},
     State1 = update_or_remove_sub(Meta, ConsumerId, Con, State0),
-    Indexes = delete_indexes(Discarded, Indexes0),
     State = maps:fold(fun(_, Msg, Acc) ->
-                              add_bytes_settle_or_discard(
+                              add_bytes_settle(
                                 get_msg_header(Msg), Acc)
                       end, State1, Discarded),
-    {State#?MODULE{messages_total = Tot - length(DiscardedMsgIds),
-                   ra_indexes = Indexes}, Effects}.
+    case Delete of
+        true ->
+            Indexes = delete_indexes(Discarded, Indexes0),
+            State#?MODULE{messages_total = Tot - length(DiscardedMsgIds),
+                          ra_indexes = Indexes};
+        false ->
+            State
+    end.
 
 delete_indexes(Msgs, Indexes) when is_map(Msgs) ->
     %% TODO: optimise by passing a list to rabbit_fifo_index
@@ -1586,10 +1576,9 @@ increase_credit(#consumer{credit = Current}, Credit) ->
 
 complete_and_checkout(#{index := IncomingRaftIdx} = Meta, MsgIds, ConsumerId,
                       #consumer{} = Con0,
-                      Effects0, State0) ->
-    {State1, Effects1} = complete(Meta, ConsumerId, MsgIds, Con0,
-                                  Effects0, State0),
-    {State, ok, Effects} = checkout(Meta, State0, State1, Effects1, false),
+                      Effects0, State0, Delete) ->
+    State1 = complete(Meta, ConsumerId, MsgIds, Con0, State0, Delete),
+    {State, ok, Effects} = checkout(Meta, State0, State1, Effects0, false),
     update_smallest_raft_index(IncomingRaftIdx, State, Effects).
 
 dead_letter_effects(_Reason, _Discarded,
@@ -1711,19 +1700,6 @@ get_header(_Key, Header) when is_integer(Header) ->
 get_header(Key, Header) when is_map(Header) ->
     maps:get(Key, Header, undefined).
 
-%%TODO can we remove discard_one function and instead call complete()
-%% because complete completes a message from a consumer.
-%% This helps later on when refactoring to call dlx for reasons other than 'rejected'.
-discard_one(MsgId, Msg, Reason, ConsumerId, #?MODULE{consumers = Consumers,
-                                             dlx = DlxState0} = State0) ->
-    #consumer{checked_out = Checked} = Con0 = maps:get(ConsumerId, Consumers),
-    Con = Con0#consumer{checked_out = maps:remove(MsgId, Checked)},
-    Header = get_msg_header(Msg),
-    State1 = add_bytes_settle_or_discard(Header, State0),
-    DlxState = rabbit_fifo_dlx:discard(Msg, Reason, DlxState0),
-    State1#?MODULE{consumers = Consumers#{ConsumerId => Con},
-                   dlx = DlxState}.
-
 return_one(Meta, MsgId, Msg0,
            #?MODULE{returns = Returns,
                     consumers = Consumers,
@@ -1738,7 +1714,8 @@ return_one(Meta, MsgId, Msg0,
             %% TODO respect dead-letter-strategy at-least-once
             Effects = dead_letter_effects(delivery_limit, [Msg],
                                           State0, Effects0),
-            complete(Meta, ConsumerId, [MsgId], Con0, Effects, State0);
+            State = complete(Meta, ConsumerId, [MsgId], Con0, State0, true),
+            {State, Effects};
         _ ->
             Con = Con0#consumer{checked_out = maps:remove(MsgId, Checked)},
 
@@ -2299,8 +2276,8 @@ add_bytes_checkout(Header,
     State#?MODULE{msg_bytes_checkout = Checkout + Size,
                   msg_bytes_enqueue = Enqueue - Size}.
 
-add_bytes_settle_or_discard(Header,
-                            #?MODULE{msg_bytes_checkout = Checkout} = State) ->
+add_bytes_settle(Header,
+                 #?MODULE{msg_bytes_checkout = Checkout} = State) ->
     Size = get_header(size, Header),
     State#?MODULE{msg_bytes_checkout = Checkout - Size}.
 
