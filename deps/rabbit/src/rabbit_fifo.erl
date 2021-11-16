@@ -1530,7 +1530,7 @@ return(#{index := IncomingRaftIdx} = Meta, ConsumerId, Returned,
     {State, ok, Effects} = checkout(Meta, State0, State2, Effects1, false),
     update_smallest_raft_index(IncomingRaftIdx, State, Effects).
 
-% used to processes messages that are finished
+% used to process messages that are finished
 complete(Meta, ConsumerId, DiscardedMsgIds,
          #consumer{checked_out = Checked} = Con0,
          #?MODULE{messages_total = Tot,
@@ -1703,7 +1703,9 @@ get_header(Key, Header) when is_map(Header) ->
 return_one(Meta, MsgId, Msg0,
            #?MODULE{returns = Returns,
                     consumers = Consumers,
-                    cfg = #cfg{delivery_limit = DeliveryLimit}} = State0,
+                    dlx = DlxState0,
+                    cfg = #cfg{delivery_limit = DeliveryLimit,
+                               dead_letter_handler = DLH}} = State0,
            Effects0, ConsumerId) ->
     #consumer{checked_out = Checked} = Con0 = maps:get(ConsumerId, Consumers),
     Msg = update_msg_header(delivery_count, fun (C) -> C + 1 end, 1, Msg0),
@@ -1711,11 +1713,17 @@ return_one(Meta, MsgId, Msg0,
     case get_header(delivery_count, Header) of
         DeliveryCount when DeliveryCount > DeliveryLimit ->
             %% TODO: don't do for prefix msgs
-            %% TODO respect dead-letter-strategy at-least-once
-            Effects = dead_letter_effects(delivery_limit, [Msg],
-                                          State0, Effects0),
-            State = complete(Meta, ConsumerId, [MsgId], Con0, State0, true),
-            {State, Effects};
+            case DLH of
+                at_least_once ->
+                    DlxState = rabbit_fifo_dlx:discard(Msg, delivery_limit, DlxState0),
+                    State = complete(Meta, ConsumerId, [MsgId], Con0, State0#?MODULE{dlx = DlxState}, false),
+                    {State, Effects0};
+                _ ->
+                    Effects = dead_letter_effects(delivery_limit, [Msg],
+                                                  State0, Effects0),
+                    State = complete(Meta, ConsumerId, [MsgId], Con0, State0, true),
+                    {State, Effects}
+            end;
         _ ->
             Con = Con0#consumer{checked_out = maps:remove(MsgId, Checked)},
 
