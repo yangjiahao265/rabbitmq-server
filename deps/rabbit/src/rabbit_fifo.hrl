@@ -33,10 +33,13 @@
 
 -type msg_header() :: msg_size() |
                       #{size := msg_size(),
-                        delivery_count => non_neg_integer()}.
+                        delivery_count => non_neg_integer(),
+                        expiry => milliseconds()}.
 %% The message header:
 %% delivery_count: the number of unsuccessful delivery attempts.
 %%                 A non-zero value indicates a previous attempt.
+%% expiry: Epoch time in ms when a message expires. Set during enqueue.
+%%         Value is determined by per-queue or per-message message TTL.
 %% If it only contains the size it can be condensed to an integer only
 
 -type msg() :: ?MSG(msg_header(), raw_msg()) |
@@ -122,7 +125,7 @@
 -record(enqueuer,
         {next_seqno = 1 :: msg_seqno(),
          % out of order enqueues - sorted list
-         pending = [] :: [{msg_seqno(), ra:index(), raw_msg()}],
+         pending = [] :: [{msg_seqno(), ra:index(), milliseconds(), raw_msg()}],
          status = up :: up |
                         suspected_down,
          %% it is useful to have a record of when this was blocked
@@ -149,6 +152,7 @@
          max_in_memory_length :: option(non_neg_integer()),
          max_in_memory_bytes :: option(non_neg_integer()),
          expires :: undefined | milliseconds(),
+         msg_ttl :: undefined | milliseconds(),
          unused_1,
          unused_2
         }).
@@ -221,5 +225,6 @@
                     single_active_consumer_on => boolean(),
                     delivery_limit => non_neg_integer(),
                     expires => non_neg_integer(),
+                    msg_ttl => non_neg_integer(),
                     created => non_neg_integer()
                    }.

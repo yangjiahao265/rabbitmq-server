@@ -234,6 +234,7 @@ ra_machine_config(Q) when ?is_amqqueue(Q) ->
     MaxMemoryBytes = args_policy_lookup(<<"max-in-memory-bytes">>, fun min/2, Q),
     DeliveryLimit = args_policy_lookup(<<"delivery-limit">>, fun min/2, Q),
     Expires = args_policy_lookup(<<"expires">>, fun policyHasPrecedence/2, Q),
+    MsgTTL = args_policy_lookup(<<"message-ttl">>, fun min/2, Q),
     #{name => Name,
       queue_resource => QName,
       dead_letter_handler => dead_letter_handler(Q, Overflow),
@@ -246,7 +247,8 @@ ra_machine_config(Q) when ?is_amqqueue(Q) ->
       delivery_limit => DeliveryLimit,
       overflow_strategy => Overflow,
       created => erlang:system_time(millisecond),
-      expires => Expires
+      expires => Expires,
+      msg_ttl => MsgTTL
      }.
 
 policyHasPrecedence(Policy, _QueueArg) ->
@@ -378,7 +380,7 @@ filter_quorum_critical(Queues, ReplicaStates) ->
 capabilities() ->
     #{unsupported_policies =>
           [ %% Classic policies
-            <<"message-ttl">>, <<"max-priority">>, <<"queue-mode">>,
+            <<"max-priority">>, <<"queue-mode">>,
             <<"single-active-consumer">>, <<"ha-mode">>, <<"ha-params">>,
             <<"ha-sync-mode">>, <<"ha-promote-on-shutdown">>, <<"ha-promote-on-failure">>,
             <<"queue-master-locator">>,
@@ -390,7 +392,8 @@ capabilities() ->
                               <<"x-max-length-bytes">>, <<"x-max-in-memory-length">>,
                               <<"x-max-in-memory-bytes">>, <<"x-overflow">>,
                               <<"x-single-active-consumer">>, <<"x-queue-type">>,
-                              <<"x-quorum-initial-group-size">>, <<"x-delivery-limit">>],
+                              <<"x-quorum-initial-group-size">>, <<"x-delivery-limit">>,
+                              <<"x-message-ttl">>],
       consumer_arguments => [<<"x-priority">>, <<"x-credit">>],
       server_named => false}.
 

@@ -149,6 +149,7 @@ update_config(Conf, State) ->
     MaxMemoryBytes = maps:get(max_in_memory_bytes, Conf, undefined),
     DeliveryLimit = maps:get(delivery_limit, Conf, undefined),
     Expires = maps:get(expires, Conf, undefined),
+    MsgTTL = maps:get(msg_ttl, Conf, undefined),
     ConsumerStrategy = case maps:get(single_active_consumer_on, Conf, false) of
                            true ->
                                single_active;
@@ -170,7 +171,8 @@ update_config(Conf, State) ->
                                 max_in_memory_bytes = MaxMemoryBytes,
                                 consumer_strategy = ConsumerStrategy,
                                 delivery_limit = DeliveryLimit,
-                                expires = Expires},
+                                expires = Expires,
+                                msg_ttl = MsgTTL},
                   last_active = LastActive}.
 
 zero(_) ->
@@ -342,17 +344,17 @@ apply(#{index := Index,
             State1 = update_consumer(ConsumerId, ConsumerMeta,
                                      {once, 1, simple_prefetch}, 0,
                                      State0),
-            {success, _, MsgId, Msg, State2} = checkout_one(Meta, State1),
+            {success, _, MsgId, Msg, State2, Effects0} = checkout_one(Meta, State1, []),
             {State4, Effects1} = case Settlement of
                                      unsettled ->
                                          {_, Pid} = ConsumerId,
-                                         {State2, [{monitor, process, Pid}]};
+                                         {State2, [{monitor, process, Pid} | Effects0]};
                                      settled ->
                                          %% immediately settle the checkout
-                                         {State3, _, Effects0} =
+                                         {State3, _, SettleEffects} =
                                          apply(Meta, make_settle(ConsumerId, [MsgId]),
                                                State2),
-                                         {State3, Effects0}
+                                         {State3, SettleEffects ++ Effects0}
                                  end,
             {Reply, Effects2} =
             case Msg of
@@ -423,6 +425,8 @@ apply(#{index := Index}, #purge{},
     update_smallest_raft_index(Index, Reply, State, Effects);
 apply(#{index := Idx}, #garbage_collection{}, State) ->
     update_smallest_raft_index(Idx, ok, State, [{aux, garbage_collection}]);
+apply(Meta, {timeout, expire_msgs}, State) ->
+    checkout(Meta, State, State, [], false);
 apply(#{system_time := Ts} = Meta, {down, Pid, noconnection},
       #?MODULE{consumers = Cons0,
                cfg = #cfg{consumer_strategy = single_active},
@@ -761,8 +765,8 @@ handle_down(Meta, Pid, #?MODULE{consumers = Cons0,
     % This should be ok as we won't see any more enqueues from this pid
     State1 = case maps:take(Pid, Enqs0) of
                  {#enqueuer{pending = Pend}, Enqs} ->
-                     lists:foldl(fun ({_, RIdx, RawMsg}, S) ->
-                                         enqueue(RIdx, RawMsg, S)
+                     lists:foldl(fun ({_, RIdx, Ts, RawMsg}, S) ->
+                                         enqueue(RIdx, Ts, RawMsg, S)
                                  end, State0#?MODULE{enqueuers = Enqs}, Pend);
                  error ->
                      State0
@@ -912,6 +916,7 @@ overview(#?MODULE{consumers = Cons,
              max_in_memory_length => Cfg#cfg.max_in_memory_length,
              max_in_memory_bytes => Cfg#cfg.max_in_memory_bytes,
              expires => Cfg#cfg.expires,
+             msg_ttl => Cfg#cfg.msg_ttl,
              delivery_limit => Cfg#cfg.delivery_limit
             },
     {Smallest, _} = smallest_raft_index(State),
@@ -1369,8 +1374,9 @@ maybe_return_all(#{system_time := Ts} = Meta, ConsumerId, Consumer, S0, Effects0
              Effects1}
     end.
 
-apply_enqueue(#{index := RaftIdx} = Meta, From, Seq, RawMsg, State0) ->
-    case maybe_enqueue(RaftIdx, From, Seq, RawMsg, [], State0) of
+apply_enqueue(#{index := RaftIdx,
+                system_time := Ts} = Meta, From, Seq, RawMsg, State0) ->
+    case maybe_enqueue(RaftIdx, Ts, From, Seq, RawMsg, [], State0) of
         {ok, State1, Effects1} ->
             State2 = incr_enqueue_count(incr_total(State1)),
             {State, ok, Effects} = checkout(Meta, State0, State2, Effects1, false),
@@ -1409,10 +1415,11 @@ drop_head(#?MODULE{ra_indexes = Indexes0} = State0, Effects0) ->
             {State0, Effects0}
     end.
 
-enqueue(RaftIdx, RawMsg, #?MODULE{messages = Messages} = State0) ->
+enqueue(RaftIdx, Ts, RawMsg, #?MODULE{messages = Messages} = State0) ->
     %% the initial header is an integer only - it will get expanded to a map
     %% when the next required key is added
-    Header = message_size(RawMsg),
+    Header0 = message_size(RawMsg),
+    Header = maybe_set_msg_ttl(RawMsg, Ts, Header0, State0),
     {State1, Msg} =
         case evaluate_memory_limit(Header, State0) of
             true ->
@@ -1425,6 +1432,19 @@ enqueue(RaftIdx, RawMsg, #?MODULE{messages = Messages} = State0) ->
         end,
     State = add_bytes_enqueue(Header, State1),
     State#?MODULE{messages = lqueue:in(Msg, Messages)}.
+
+maybe_set_msg_ttl(#basic_message{content = Content},
+                  RaCmdTs, Header,
+                  #?MODULE{cfg = #cfg{msg_ttl = PerQueueMsgTTL}}) ->
+    #content{properties = Props} = rabbit_binary_parser:ensure_content_decoded(Content),
+    %% We assert that the expiration must be valid - we check in the channel.
+    {ok, PerMsgMsgTTL} = rabbit_basic:parse_expiration(Props),
+    case min(PerMsgMsgTTL, PerQueueMsgTTL) of
+        undefined ->
+            Header;
+        TTL ->
+            update_header(expiry, fun(Ts) -> Ts end, RaCmdTs + TTL, Header)
+    end.
 
 incr_enqueue_count(#?MODULE{enqueue_count = EC,
                             cfg = #cfg{release_cursor_interval = {_Base, C}}
@@ -1467,31 +1487,31 @@ maybe_store_dehydrated_state(_RaftIdx, State) ->
 
 enqueue_pending(From,
                 #enqueuer{next_seqno = Next,
-                          pending = [{Next, RaftIdx, RawMsg} | Pending]} = Enq0,
+                          pending = [{Next, RaftIdx, Ts, RawMsg} | Pending]} = Enq0,
                 State0) ->
-            State = enqueue(RaftIdx, RawMsg, State0),
+            State = enqueue(RaftIdx, Ts, RawMsg, State0),
             Enq = Enq0#enqueuer{next_seqno = Next + 1, pending = Pending},
             enqueue_pending(From, Enq, State);
 enqueue_pending(From, Enq, #?MODULE{enqueuers = Enqueuers0} = State) ->
     State#?MODULE{enqueuers = Enqueuers0#{From => Enq}}.
 
-maybe_enqueue(RaftIdx, undefined, undefined, RawMsg, Effects, State0) ->
+maybe_enqueue(RaftIdx, Ts, undefined, undefined, RawMsg, Effects, State0) ->
     % direct enqueue without tracking
-    State = enqueue(RaftIdx, RawMsg, State0),
+    State = enqueue(RaftIdx, Ts, RawMsg, State0),
     {ok, State, Effects};
-maybe_enqueue(RaftIdx, From, MsgSeqNo, RawMsg, Effects0,
+maybe_enqueue(RaftIdx, Ts, From, MsgSeqNo, RawMsg, Effects0,
               #?MODULE{enqueuers = Enqueuers0,
                        ra_indexes = Indexes0} = State0) ->
 
     case maps:get(From, Enqueuers0, undefined) of
         undefined ->
             State1 = State0#?MODULE{enqueuers = Enqueuers0#{From => #enqueuer{}}},
-            {ok, State, Effects} = maybe_enqueue(RaftIdx, From, MsgSeqNo,
+            {ok, State, Effects} = maybe_enqueue(RaftIdx, Ts, From, MsgSeqNo,
                                                  RawMsg, Effects0, State1),
             {ok, State, [{monitor, process, From} | Effects]};
         #enqueuer{next_seqno = MsgSeqNo} = Enq0 ->
             % it is the next expected seqno
-            State1 = enqueue(RaftIdx, RawMsg, State0),
+            State1 = enqueue(RaftIdx, Ts, RawMsg, State0),
             Enq = Enq0#enqueuer{next_seqno = MsgSeqNo + 1},
             State = enqueue_pending(From, Enq, State1),
             {ok, State, Effects0};
@@ -1772,15 +1792,12 @@ checkout(Meta, OldState, State, Effects) ->
 
 checkout(#{index := Index} = Meta,
          #?MODULE{cfg = #cfg{resource = QName}} = OldState,
-         #?MODULE{dlx = DlxState0} = State0,
-         Effects0, HandleConsumerChanges) ->
+         State0, Effects0, HandleConsumerChanges) ->
+    {#?MODULE{dlx = DlxState0} = State1, _Result, Effects1} = checkout0(Meta, checkout_one(Meta, State0, Effects0), #{}),
     %%TODO For now we checkout the discards queue here. Move it to a better place
-    %% because we need to check only when messages got discarded or discard consumer subscribed or acked.
     {DlxState1, DlxDeliveryEffects} = rabbit_fifo_dlx:checkout(DlxState0),
-    State1 = State0#?MODULE{dlx = DlxState1},
-    Effects1 = DlxDeliveryEffects ++ Effects0,
-    {State2, _Result, Effects2} = checkout0(Meta, checkout_one(Meta, State1),
-                                            Effects1, #{}),
+    State2 = State1#?MODULE{dlx = DlxState1},
+    Effects2 = DlxDeliveryEffects ++ Effects1,
     case evaluate_limit(Index, false, OldState, State2, Effects2) of
         {State, true, Effects} ->
             case maybe_notify_decorators(State, HandleConsumerChanges) of
@@ -1801,27 +1818,27 @@ checkout(#{index := Index} = Meta,
     end.
 
 checkout0(Meta, {success, ConsumerId, MsgId,
-                 ?INDEX_MSG(RaftIdx, ?DISK_MSG(Header)), State},
-          Effects, SendAcc0) when is_integer(RaftIdx) ->
+                 ?INDEX_MSG(RaftIdx, ?DISK_MSG(Header)), State, Effects},
+          SendAcc0) when is_integer(RaftIdx) ->
     DelMsg = {RaftIdx, {MsgId, Header}},
     SendAcc = maps:update_with(ConsumerId,
-                           fun ({InMem, LogMsgs}) ->
-                                   {InMem, [DelMsg | LogMsgs]}
-                           end, {[], [DelMsg]}, SendAcc0),
-    checkout0(Meta, checkout_one(Meta, State), Effects, SendAcc);
+                               fun ({InMem, LogMsgs}) ->
+                                       {InMem, [DelMsg | LogMsgs]}
+                               end, {[], [DelMsg]}, SendAcc0),
+    checkout0(Meta, checkout_one(Meta, State, Effects), SendAcc);
 checkout0(Meta, {success, ConsumerId, MsgId,
-                 ?INDEX_MSG(Idx, ?MSG(Header, Msg)), State}, Effects,
+                 ?INDEX_MSG(Idx, ?MSG(Header, Msg)), State, Effects},
           SendAcc0) when is_integer(Idx) ->
     DelMsg = {MsgId, {Header, Msg}},
     SendAcc = maps:update_with(ConsumerId,
-                           fun ({InMem, LogMsgs}) ->
-                                   {[DelMsg | InMem], LogMsgs}
-                           end, {[DelMsg], []}, SendAcc0),
-    checkout0(Meta, checkout_one(Meta, State), Effects, SendAcc);
-checkout0(Meta, {success, _ConsumerId, _MsgId, ?TUPLE(_, _), State}, Effects,
+                               fun ({InMem, LogMsgs}) ->
+                                       {[DelMsg | InMem], LogMsgs}
+                               end, {[DelMsg], []}, SendAcc0),
+    checkout0(Meta, checkout_one(Meta, State, Effects), SendAcc);
+checkout0(Meta, {success, _ConsumerId, _MsgId, ?TUPLE(_, _), State, Effects},
           SendAcc) ->
-    checkout0(Meta, checkout_one(Meta, State), Effects, SendAcc);
-checkout0(_Meta, {Activity, State0}, Effects0, SendAcc) ->
+    checkout0(Meta, checkout_one(Meta, State, Effects), SendAcc);
+checkout0(_Meta, {Activity, State0, Effects0}, SendAcc) ->
     Effects1 = case Activity of
                    nochange ->
                        append_delivery_effects(Effects0, SendAcc);
@@ -1972,9 +1989,12 @@ reply_log_effect(RaftIdx, MsgId, Header, Ready, From) ->
                              {dequeue, {MsgId, {Header, Msg}}, Ready}}}]
      end}.
 
-checkout_one(Meta, #?MODULE{service_queue = SQ0,
-                            messages = Messages0,
-                            consumers = Cons0} = InitState) ->
+checkout_one(#{system_time := Ts} = Meta, InitState0, Effects0) ->
+    %% Before checking out any messsage to any consumer,
+    %% first remove all expired messages from the head of the queue.
+    {#?MODULE{service_queue = SQ0,
+              messages = Messages0,
+              consumers = Cons0} = InitState, Effects1} = expire_msgs(Ts, InitState0, Effects0),
     case priority_queue:out(SQ0) of
         {{value, ConsumerId}, SQ1}
           when is_map_key(ConsumerId, Cons0) ->
@@ -1987,11 +2007,11 @@ checkout_one(Meta, #?MODULE{service_queue = SQ0,
                             %% no credit but was still on queue
                             %% can happen when draining
                             %% recurse without consumer on queue
-                            checkout_one(Meta, InitState#?MODULE{service_queue = SQ1});
+                            checkout_one(Meta, InitState#?MODULE{service_queue = SQ1}, Effects1);
                         #consumer{status = cancelled} ->
-                            checkout_one(Meta, InitState#?MODULE{service_queue = SQ1});
+                            checkout_one(Meta, InitState#?MODULE{service_queue = SQ1}, Effects1);
                         #consumer{status = suspected_down} ->
-                            checkout_one(Meta, InitState#?MODULE{service_queue = SQ1});
+                            checkout_one(Meta, InitState#?MODULE{service_queue = SQ1}, Effects1);
                         #consumer{checked_out = Checked0,
                                   next_msg_id = Next,
                                   credit = Credit,
@@ -2012,22 +2032,72 @@ checkout_one(Meta, #?MODULE{service_queue = SQ0,
                                             subtract_in_memory_counts(
                                               Header, add_bytes_checkout(Header, State1))
                                     end,
-                            {success, ConsumerId, Next, ConsumerMsg, State};
+                            {success, ConsumerId, Next, ConsumerMsg, State, Effects1};
                         error ->
                             %% consumer did not exist but was queued, recurse
-                            checkout_one(Meta, InitState#?MODULE{service_queue = SQ1})
+                            checkout_one(Meta, InitState#?MODULE{service_queue = SQ1}, Effects1)
                     end;
                 empty ->
-                    {nochange, InitState}
+                    {nochange, InitState, Effects1}
             end;
         {{value, _ConsumerId}, SQ1} ->
             %% consumer did not exist but was queued, recurse
-            checkout_one(Meta, InitState#?MODULE{service_queue = SQ1});
+            checkout_one(Meta, InitState#?MODULE{service_queue = SQ1}, Effects1);
         {empty, _} ->
+            Effects = timer_effect(Ts, InitState, Effects1),
             case lqueue:len(Messages0) of
-                0 -> {nochange, InitState};
-                _ -> {inactive, InitState}
+                0 -> {nochange, InitState, Effects};
+                _ -> {inactive, InitState, Effects}
             end
+    end.
+
+%%TODO make sure effect is re-issued when becoming leader
+timer_effect(RaCmdTs, State, Effects) ->
+    T = case take_next_msg(State) of
+            {?INDEX_MSG(_, ?MSG(#{expiry := Expiry}, _)), _} ->
+                %% Next message contains 'expiry' header.
+                %% (Re)set timer so that mesage will be dropped or dead-lettered on time.
+                Expiry - RaCmdTs;
+            _ ->
+                %% Next message does not contain 'expiry' header.
+                %% Therefore, do not set timer or cancel timer if it was set.
+                infinity
+        end,
+    [{timer, expire_msgs, T} | Effects].
+
+%% remove all expired messages from head of queue
+expire_msgs(RaCmdTs, State0, Effects0) ->
+    case take_next_msg(State0) of
+        {?INDEX_MSG(Idx, ?MSG(#{expiry := Expiry} = Header, _) = Msg) = FullMsg, State1}
+          when RaCmdTs >= Expiry ->
+            #?MODULE{dlx = DlxState0,
+                     cfg = #cfg{dead_letter_handler = DLH},
+                     ra_indexes = Indexes0} = State2 = add_bytes_drop(Header, State1),
+            case DLH of
+                at_least_once ->
+                    DlxState = rabbit_fifo_dlx:discard(FullMsg, expired, DlxState0),
+                    State = State2#?MODULE{dlx = DlxState},
+                    expire_msgs(RaCmdTs, State, Effects0);
+                _ ->
+                    Indexes = rabbit_fifo_index:delete(Idx, Indexes0),
+                    State3 = decr_total(State2),
+                    State4 = case Msg of
+                                 ?DISK_MSG(_) -> State3;
+                                 _ ->
+                                     subtract_in_memory_counts(Header, State3)
+                             end,
+                    Effects = dead_letter_effects(expired, [FullMsg],
+                                                  State4, Effects0),
+                    State = State4#?MODULE{ra_indexes = Indexes},
+                    expire_msgs(RaCmdTs, State, Effects)
+            end;
+        %%TODO re-use drop_head code
+        {?PREFIX_MEM_MSG(_Header), _State1} ->
+            exit(not_implemented);
+        {?DISK_MSG(_Header), _State1} ->
+            exit(not_implemented);
+        _ ->
+            {State0, Effects0}
     end.
 
 update_or_remove_sub(_Meta, ConsumerId, #consumer{lifetime = auto,

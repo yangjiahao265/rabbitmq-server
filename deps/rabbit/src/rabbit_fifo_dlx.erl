@@ -157,7 +157,7 @@ checkout0({success, MsgId, {Reason, ?INDEX_MSG(Idx, ?MSG(Header, Msg))}, State},
     DelMsg = {MsgId, {Reason, Header, Msg}},
     SendAcc = {[DelMsg|InMemMsgs], LogMsgs},
     checkout0(checkout_one(State), SendAcc);
-%TODO Is that a fallback for old message formats?
+%TODO Is that a no-op for prefix messages after recovery?
 % checkout0({success, _MsgId, ?TUPLE(_, _), State}, SendAcc) ->
 % checkout0(checkout_one(State), SendAcc);
 checkout0(#state{consumer = #dlx_consumer{registered_name = RegName}} = State, SendAcc) ->
