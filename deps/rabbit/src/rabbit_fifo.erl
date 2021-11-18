@@ -90,6 +90,22 @@
 -record(update_config, {config :: config()}).
 -record(garbage_collection, {}).
 
+-define(ENQUEUE, 1).
+-define(SETTLE, 4).
+-define(RETURN, 5).
+-define(DISCARD, 6).
+-define(CREDIT, 7).
+
+-type enqueuer_id() :: non_neg_integer(). %% integer that maps to a pid passwed during register_enqeuuer 
+-type consumer_id2() :: non_neg_integer().%% integer that maps to a consumer_id()
+
+-type enqueue() :: {?ENQUEUE, enqueuer_id(), option(msg_seqno()), raw_msg()}.
+-type settle() :: {?SETTLE, consumer_id2(), [msg_id()]}.
+-type return() :: {?RETURN, consumer_id2(), [msg_id()]}.
+-type discard() :: {?DISCARD, consumer_id2(), [msg_id()]}.
+-type credit() :: {?CREDIT, consumer_id2(), Credit :: non_neg_integer(),
+                   DeliveryCount :: non_neg_integer(), Drain :: boolean()}.
+
 -opaque protocol() ::
     #enqueue{} |
     #register_enqueuer{} |
