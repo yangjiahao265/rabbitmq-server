@@ -37,7 +37,7 @@
          member_pid :: pid(),
          offset :: osiris:offset(),
          subscription_id :: subscription_id(),
-         segment :: osiris_log:state(),
+         segment :: undefined | osiris_log:state(),
          credit :: integer(),
          stream :: stream(),
          counters :: atomics:atomics_ref(),
@@ -763,6 +763,34 @@ open(info, {OK, S, Data},
              StatemData#statem_data{connection = Connection1,
                                     connection_state = State2}}
     end;
+open(info, {sac, {{subscription_id, SubId}, {active, Active}}},
+     #statem_data{transport = Transport,
+                  connection = Connection0,
+                  connection_state = ConnState0} =
+         State) ->
+    rabbit_log:debug("Subscription ~p instructed to become active: ~p",
+                     [SubId, Active]),
+    #stream_connection_state{consumers = Consumers0} = ConnState0,
+    {Connection1, ConnState1} =
+        case Consumers0 of
+            #{SubId := Consumer0} ->
+                Consumer1 = Consumer0#consumer{active = Active},
+                Conn1 =
+                    maybe_notify_consumer(Transport,
+                                          Connection0,
+                                          SubId,
+                                          Active,
+                                          true),
+                {Conn1,
+                 ConnState0#stream_connection_state{consumers =
+                                                        Consumers0#{SubId =>
+                                                                        Consumer1}}};
+            _ ->
+                {Connection0, ConnState0}
+        end,
+    {keep_state,
+     State#statem_data{connection = Connection1,
+                       connection_state = ConnState1}};
 open(info, {Closed, Socket}, #statem_data{connection = Connection})
     when Closed =:= tcp_closed; Closed =:= ssl_closed ->
     demonitor_all_streams(Connection),
@@ -1001,15 +1029,19 @@ open(cast,
                                                   maps:remove(StreamName,
                                                               StreamSubscriptions)},
                  State};
-            CorrelationIds when is_list(CorrelationIds) ->
+            SubscriptionIds when is_list(SubscriptionIds) ->
                 Consumers1 =
-                    lists:foldl(fun(CorrelationId, ConsumersAcc) ->
-                                   #{CorrelationId := Consumer} = ConsumersAcc,
-                                   #consumer{credit = Credit} = Consumer,
+                    lists:foldl(fun(SubscriptionId, ConsumersAcc) ->
+                                   #{SubscriptionId := Consumer} = ConsumersAcc,
+                                   #consumer{credit = Credit,
+                                             segment = Segment} =
+                                       Consumer,
                                    Consumer1 =
-                                       case Credit of
-                                           0 -> Consumer;
-                                           _ ->
+                                       case {Credit, Segment} of
+                                           {_, undefined} ->
+                                               Consumer; %% SAC not active
+                                           {0, _} -> Consumer;
+                                           {_, _} ->
                                                case send_chunks(Transport,
                                                                 Consumer,
                                                                 SendFileOct)
@@ -1034,9 +1066,9 @@ open(cast,
                                                                              Credit1}
                                                end
                                        end,
-                                   ConsumersAcc#{CorrelationId => Consumer1}
+                                   ConsumersAcc#{SubscriptionId => Consumer1}
                                 end,
-                                Consumers, CorrelationIds),
+                                Consumers, SubscriptionIds),
                 {Connection,
                  State#stream_connection_state{consumers = Consumers1}}
         end,
@@ -1812,7 +1844,8 @@ handle_frame_post_auth(Transport,
                                 atomics:new(2, [{signed, false}]),
 
                             Active =
-                                maybe_register_consumer(Stream,
+                                maybe_register_consumer(VirtualHost,
+                                                        Stream,
                                                         ConsumerName,
                                                         SubscriptionId,
                                                         Sac),
@@ -1889,6 +1922,8 @@ handle_frame_post_auth(Transport,
                            Connection,
                        #stream_connection_state{consumers = Consumers} = State,
                        {credit, SubscriptionId, Credit}) ->
+    %% FIXME check consumer is active
+    %% if not active, don't dispatch, just return appropriate response
     case Consumers of
         #{SubscriptionId := Consumer} ->
             #consumer{credit = AvailableCredit} = Consumer,
@@ -2573,11 +2608,16 @@ maybe_dispatch_on_subscription(_Transport,
     Consumers1 = Consumers#{SubscriptionId => ConsumerState},
     State#stream_connection_state{consumers = Consumers1}.
 
-maybe_register_consumer(_, _, _, false = _Sac) ->
+maybe_register_consumer(_, _, _, _, false = _Sac) ->
     true;
-maybe_register_consumer(Stream, ConsumerName, SubscriptionId, true) ->
+maybe_register_consumer(VirtualHost,
+                        Stream,
+                        ConsumerName,
+                        SubscriptionId,
+                        true) ->
     {ok, Active} =
-        rabbit_stream_sac_coordinator:register_consumer(Stream,
+        rabbit_stream_sac_coordinator:register_consumer(VirtualHost,
+                                                        Stream,
                                                         ConsumerName,
                                                         self(),
                                                         SubscriptionId),
@@ -2606,6 +2646,20 @@ maybe_notify_consumer(Transport,
     send(Transport, S, Frame),
     Connection#stream_connection{correlation_id_sequence = CorrIdSeq + 1,
                                  outstanding_requests = OutstandingRequests1}.
+
+maybe_unregister_consumer(_, _, false = _Sac) ->
+    ok;
+maybe_unregister_consumer(VirtualHost,
+                          #consumer{stream = Stream,
+                                    properties = Properties,
+                                    subscription_id = SubscriptionId},
+                          true = _Sac) ->
+    ConsumerName = consumer_name(Properties),
+    rabbit_stream_sac_coordinator:unregister_consumer(VirtualHost,
+                                                      Stream,
+                                                      ConsumerName,
+                                                      self(),
+                                                      SubscriptionId).
 
 notify_connection_closed(#statem_data{connection =
                                           #stream_connection{name = Name,
@@ -2757,7 +2811,8 @@ lookup_leader_from_manager(VirtualHost, Stream) ->
     rabbit_stream_manager:lookup_leader(VirtualHost, Stream).
 
 remove_subscription(SubscriptionId,
-                    #stream_connection{stream_subscriptions =
+                    #stream_connection{virtual_host = VirtualHost,
+                                       stream_subscriptions =
                                            StreamSubscriptions} =
                         Connection,
                     #stream_connection_state{consumers = Consumers} = State) ->
@@ -2782,6 +2837,8 @@ remove_subscription(SubscriptionId,
     rabbit_stream_metrics:consumer_cancelled(self(),
                                              stream_r(Stream, Connection2),
                                              SubscriptionId),
+    maybe_unregister_consumer(VirtualHost, Consumer,
+                              single_active_consumer(Consumer#consumer.properties)),
     {Connection2, State#stream_connection_state{consumers = Consumers1}}.
 
 maybe_clean_connection_from_stream(Stream,
