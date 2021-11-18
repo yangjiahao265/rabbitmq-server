@@ -1442,6 +1442,8 @@ maybe_set_msg_ttl(#basic_message{content = Content},
     case min(PerMsgMsgTTL, PerQueueMsgTTL) of
         undefined ->
             Header;
+        0 ->
+            update_header(expiry, fun(Ts) -> Ts end, immediate, Header);
         TTL ->
             update_header(expiry, fun(Ts) -> Ts end, RaCmdTs + TTL, Header)
     end.
@@ -2044,32 +2046,21 @@ checkout_one(#{system_time := Ts} = Meta, InitState0, Effects0) ->
             %% consumer did not exist but was queued, recurse
             checkout_one(Meta, InitState#?MODULE{service_queue = SQ1}, Effects1);
         {empty, _} ->
-            Effects = timer_effect(Ts, InitState, Effects1),
+            Effects2 = timer_effect(Ts, InitState, Effects1),
             case lqueue:len(Messages0) of
-                0 -> {nochange, InitState, Effects};
-                _ -> {inactive, InitState, Effects}
+                0 ->
+                    {nochange, InitState, Effects2};
+                _ ->
+                    {State, Effects} = maybe_remove_immediate_msg(InitState, Effects2),
+                    {inactive, State, Effects}
             end
     end.
-
-%%TODO make sure effect is re-issued when becoming leader
-timer_effect(RaCmdTs, State, Effects) ->
-    T = case take_next_msg(State) of
-            {?INDEX_MSG(_, ?MSG(#{expiry := Expiry}, _)), _} ->
-                %% Next message contains 'expiry' header.
-                %% (Re)set timer so that mesage will be dropped or dead-lettered on time.
-                Expiry - RaCmdTs;
-            _ ->
-                %% Next message does not contain 'expiry' header.
-                %% Therefore, do not set timer or cancel timer if it was set.
-                infinity
-        end,
-    [{timer, expire_msgs, T} | Effects].
 
 %% remove all expired messages from head of queue
 expire_msgs(RaCmdTs, State0, Effects0) ->
     case take_next_msg(State0) of
         {?INDEX_MSG(Idx, ?MSG(#{expiry := Expiry} = Header, _) = Msg) = FullMsg, State1}
-          when RaCmdTs >= Expiry ->
+          when is_number(Expiry), RaCmdTs >= Expiry ->
             #?MODULE{dlx = DlxState0,
                      cfg = #cfg{dead_letter_handler = DLH},
                      ra_indexes = Indexes0} = State2 = add_bytes_drop(Header, State1),
@@ -2096,6 +2087,59 @@ expire_msgs(RaCmdTs, State0, Effects0) ->
             exit(not_implemented);
         {?DISK_MSG(_Header), _State1} ->
             exit(not_implemented);
+        _ ->
+            {State0, Effects0}
+    end.
+
+%%TODO make sure effect is re-issued when becoming leader
+timer_effect(RaCmdTs, State, Effects) ->
+    T = case take_next_msg(State) of
+            {?INDEX_MSG(_, ?MSG(#{expiry := Expiry}, _)), _} when is_number(Expiry) ->
+                %% Next message contains 'expiry' header.
+                %% (Re)set timer so that mesage will be dropped or dead-lettered on time.
+                Expiry - RaCmdTs;
+            _ ->
+                %% Next message does not contain 'expiry' header.
+                %% Therefore, do not set timer or cancel timer if it was set.
+                infinity
+        end,
+    [{timer, expire_msgs, T} | Effects].
+
+%% Drops or dead-letters a message that got just enqueued but could not be checked out
+%% to a consumer immediately.
+%%
+%% This behaviour complies with classic queues. Docs:
+%% "Setting the TTL to 0 causes messages to be expired upon reaching a queue
+%% unless they can be delivered to a consumer immediately.
+%% Thus this provides an alternative to the immediate publishing flag,
+%% which the RabbitMQ server does not support.
+%% Unlike that flag, no basic.returns are issued,
+%% and if a dead letter exchange is set then messages will be dead-lettered."
+maybe_remove_immediate_msg(#?MODULE{messages = Messages0} = State0, Effects0) ->
+    case lqueue:out_r(Messages0) of
+        {{value, ?INDEX_MSG(Idx, ?MSG(#{expiry := immediate} = Header, _) = Msg) = FullMsg}, Messages} ->
+            State1 = State0#?MODULE{messages = Messages},
+            #?MODULE{dlx = DlxState0,
+                     cfg = #cfg{dead_letter_handler = DLH},
+                     ra_indexes = Indexes0} = State2 = add_bytes_drop(Header, State1),
+            case DLH of
+                at_least_once ->
+                    Indexes = rabbit_fifo_index:append(Idx, Indexes0),
+                    DlxState = rabbit_fifo_dlx:discard(FullMsg, expired, DlxState0),
+                    State = State2#?MODULE{dlx = DlxState,
+                                           ra_indexes = Indexes},
+                    {State, Effects0};
+                _ ->
+                    State3 = decr_total(State2),
+                    State = case Msg of
+                                ?DISK_MSG(_) -> State3;
+                                _ ->
+                                    subtract_in_memory_counts(Header, State3)
+                            end,
+                    Effects = dead_letter_effects(expired, [FullMsg],
+                                                  State, Effects0),
+                    {State, Effects}
+            end;
         _ ->
             {State0, Effects0}
     end.
