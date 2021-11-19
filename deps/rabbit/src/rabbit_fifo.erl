@@ -564,25 +564,46 @@ apply(#{index := Idx} = Meta, #purge_nodes{nodes = Nodes}, State0) ->
                                            purge_node(Meta, Node, S, E)
                                    end, {State0, []}, Nodes),
     update_smallest_raft_index(Idx, ok, State, Effects);
-apply(#{index := Idx} = Meta, #update_config{config = Conf}, State0) ->
-    {#?MODULE{cfg = #cfg{dead_letter_handler = DLH},
-              dlx = DlxState} = State, Reply, Effects0} =
-    checkout(Meta, State0, update_config(Conf, State0), [{aux, dlx_worker}]),
-    Effects = case DLH of
-                  at_least_once ->
-                      case rabbit_fifo_dlx:consumer_pid(DlxState) of
-                          undefined ->
-                              Effects0;
-                          DlxWorkerPid ->
-                              [{send_msg, DlxWorkerPid, lookup_topology, ra_event} | Effects0]
-                      end;
-                  _ ->
-                      Effects0
-              end,
+apply(#{index := Idx} = Meta, #update_config{config = Conf},
+      #?MODULE{cfg = #cfg{dead_letter_handler = Old_DLH}} = State0) ->
+    #?MODULE{cfg = #cfg{dead_letter_handler = DLH},
+             dlx = DlxState,
+             ra_indexes = Indexes0,
+             messages_total = Tot} = State1 = update_config(Conf, State0),
+    {State3, Effects1} = case DLH of
+                             at_least_once ->
+                                 case rabbit_fifo_dlx:consumer_pid(DlxState) of
+                                     undefined ->
+                                         %% Policy changed from at-most-once to at-least-once.
+                                         %% Therefore, start rabbit_fifo_dlx_worker on leader.
+                                         {State1, [{aux, start_dlx_worker}]};
+                                     DlxWorkerPid ->
+                                         %% Leader already exists.
+                                         %% Notify leader of new policy.
+                                         Effect = {send_msg, DlxWorkerPid, lookup_topology, ra_event},
+                                         {State1, [Effect]}
+                                 end;
+                             _ when Old_DLH =:= at_least_once ->
+                                 %% Cleanup any remaining messages stored by rabbit_fifo_dlx
+                                 %% by either dropping or at-most-once dead-lettering.
+                                 ReasonMsgs = rabbit_fifo_dlx:cleanup(DlxState),
+                                 Len = length(ReasonMsgs),
+                                 rabbit_log:debug("Cleaning up ~b dead-lettered messages "
+                                                  "since dead_letter_handler changed from ~s to ~p",
+                                                  [Len, Old_DLH, DLH]),
+                                 Effects0 = dead_letter_effects(undefined, ReasonMsgs, State1, []),
+                                 {_, Msgs} = lists:unzip(ReasonMsgs),
+                                 Indexes = delete_indexes(Msgs, Indexes0),
+                                 State2 = State1#?MODULE{dlx = rabbit_fifo_dlx:init(),
+                                                         ra_indexes = Indexes,
+                                                         messages_total = Tot - Len},
+                                 {State2, Effects0}
+                         end,
+    {State, Reply, Effects} = checkout(Meta, State0, State3, Effects1),
     update_smallest_raft_index(Idx, Reply, State, Effects);
 apply(_Meta, {machine_version, FromVersion, ToVersion}, V0State) ->
     State = convert(FromVersion, ToVersion, V0State),
-    {State, ok, [{aux, dlx_worker}]};
+    {State, ok, [{aux, start_dlx_worker}]};
 %%TODO are there better approach to
 %% 1. matching against opaque rabbit_fifo_dlx:protocol / record (without exposing all the protocol details), and
 %% 2. Separate the logic running in rabbit_fifo and rabbit_fifo_dlx when dead-letter messages is acked?
@@ -1018,20 +1039,13 @@ handle_aux(_RaState, {call, _From}, {peek, Pos}, Aux0,
         Err ->
             {reply, Err, Aux0, Log0}
     end;
-handle_aux(leader, _, dlx_worker, Aux, Log,
+handle_aux(leader, _, start_dlx_worker, Aux, Log,
            #?MODULE{cfg = #cfg{resource = QRef,
                                name = QName,
                                dead_letter_handler = at_least_once}}) ->
-    rabbit_fifo_dlx:start_dlx_worker(QRef, QName),
+    rabbit_fifo_dlx:start_worker(QRef, QName),
     {no_reply, Aux, Log};
-handle_aux(leader, _, dlx_worker, Aux, Log, #?MODULE{cfg = #cfg{name = QName}}) ->
-    %%TODO when changing policies from at-least-once to at-most-once (or indirectly via overflow from
-    %% reject-publish to drop-head, terminating the dlx worker is not enough. We need to at-most-once
-    %% dead-letter all messages in the discards queue (not necessarily to deliver the messages, but to
-    %% allow for Raft log truncation).
-    rabbit_fifo_dlx:terminate_dlx_worker(QName),
-    {no_reply, Aux, Log};
-handle_aux(_, _, dlx_worker, Aux, Log, _) ->
+handle_aux(_, _, start_dlx_worker, Aux, Log, _) ->
     {no_reply, Aux, Log}.
 
 eval_gc(Log, #?MODULE{cfg = #cfg{resource = QR}} = MacState,
@@ -1577,12 +1591,14 @@ complete(Meta, ConsumerId, DiscardedMsgIds,
     end.
 
 delete_indexes(Msgs, Indexes) when is_map(Msgs) ->
+    delete_indexes(maps:values(Msgs), Indexes);
+delete_indexes(Msgs, Indexes) when is_list(Msgs) ->
     %% TODO: optimise by passing a list to rabbit_fifo_index
-    maps:fold(fun (_, ?INDEX_MSG(I, _), Acc) when is_integer(I) ->
-                      rabbit_fifo_index:delete(I, Acc);
-                  (_, _, Acc) ->
-                      Acc
-              end, Indexes, Msgs).
+    lists:foldl(fun (?INDEX_MSG(I, _), Acc) when is_integer(I) ->
+                        rabbit_fifo_index:delete(I, Acc);
+                    (_, Acc) ->
+                        Acc
+                end, Indexes, Msgs).
 
 increase_credit(#consumer{lifetime = once,
                           credit = Credit}, _) ->
@@ -1613,6 +1629,8 @@ dead_letter_effects(Reason, Discarded,
     RaftIdxs = lists:filtermap(
                  fun (?INDEX_MSG(RaftIdx, ?DISK_MSG(_Header))) ->
                          {true, RaftIdx};
+                     ({_PerMsgReason, ?INDEX_MSG(RaftIdx, ?DISK_MSG(_Header))}) when Reason =:= undefined ->
+                         {true, RaftIdx};
                      (_) ->
                          false
                  end, Discarded),
@@ -1625,6 +1643,11 @@ dead_letter_effects(Reason, Discarded,
                                       {true, {Reason, Msg}};
                                   (?INDEX_MSG(_, ?MSG(_Header, Msg))) ->
                                       {true, {Reason, Msg}};
+                                  ({PerMsgReason, ?INDEX_MSG(RaftIdx, ?DISK_MSG(_Header))}) when Reason =:= undefined ->
+                                      {enqueue, _, _, Msg} = maps:get(RaftIdx, Lookup),
+                                      {true, {PerMsgReason, Msg}};
+                                  ({PerMsgReason, ?INDEX_MSG(_, ?MSG(_Header, Msg))}) when Reason =:= undefined ->
+                                      {true, {PerMsgReason, Msg}};
                                   (_) ->
                                       false
                               end, Discarded),
@@ -2105,6 +2128,10 @@ timer_effect(RaCmdTs, State, Effects) ->
         end,
     [{timer, expire_msgs, T} | Effects].
 
+
+%%TODO instead of this method, check in expire_msgs() whether checkout Raft command ID
+%% is same as enqueue Raft command ID. If not, remove.
+%%
 %% Drops or dead-letters a message that got just enqueued but could not be checked out
 %% to a consumer immediately.
 %%

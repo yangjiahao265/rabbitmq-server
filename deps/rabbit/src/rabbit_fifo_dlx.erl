@@ -9,7 +9,7 @@
 % called by rabbit_fifo delegating DLX handling to this module
 -export([init/0, apply/2, discard/3, overview/1,
          checkout/1, state_enter/4,
-         start_dlx_worker/2, terminate_dlx_worker/1,
+         start_worker/2, terminate_worker/1, cleanup/1,
          consumer_pid/1]).
 
 %% This module handles the dead letter (DLX) part of the rabbit_fifo state machine.
@@ -222,17 +222,11 @@ delivery_effects(CPid, {InMemMsgs, IdxMsgs0}) ->
       {local, node(CPid)}}].
 
 state_enter(leader, QRef, QName, _State) ->
-    start_dlx_worker(QRef, QName);
-state_enter(_RaState, _QRef, QName, #state{consumer = C}) when C =/= undefined ->
-    %% TODO Why don't we pass OldRaftState to the ra_machine:state_enter callback?
-    %% It's super easy do so, in which case we can call terminate_child only if
-    %% old state was 'leader' and new state is not 'leader'.
-    %%
-    terminate_dlx_worker(QName);
-state_enter(_, _, _, _) ->
-    ok.
+    start_worker(QRef, QName);
+state_enter(_, _, _, State) ->
+    terminate_worker(State).
 
-start_dlx_worker(QRef, QName) ->
+start_worker(QRef, QName) ->
     RegName = registered_name(QName),
     %% We must ensure that starting the rabbit_fifo_dlx_worker succeeds.
     %% Therefore, we don't use an effect.
@@ -249,8 +243,7 @@ start_dlx_worker(QRef, QName) ->
             rabbit_log:debug("rabbit_fifo_dlx_worker (~s ~p) already started", [RegName, Pid])
     end.
 
-terminate_dlx_worker(QName) ->
-    RegName = registered_name(QName),
+terminate_worker(#state{consumer = #dlx_consumer{registered_name = RegName}}) ->
     case whereis(RegName) of
         undefined ->
             ok;
@@ -258,7 +251,9 @@ terminate_dlx_worker(QName) ->
             %% Note that we can't return a mod_call effect here because mod_call is executed on the leader only.
             ok = supervisor:terminate_child(rabbit_fifo_dlx_sup, Pid),
             rabbit_log:debug("terminated rabbit_fifo_dlx_worker (~s ~p)", [RegName, Pid])
-    end.
+    end;
+terminate_worker(_) ->
+    ok.
 
 %% TODO consider not registering the worker name at all
 %% because if there is a new worker process, it will always subscribe and tell us its new pid
@@ -269,3 +264,21 @@ consumer_pid(#state{consumer = #dlx_consumer{registered_name = Name}}) ->
     whereis(Name);
 consumer_pid(_) ->
     undefined.
+
+%% called when switching from at-least-once to at-most-once
+cleanup(#state{consumer = Consumer,
+               discards = Discards} = State) ->
+    terminate_worker(State),
+    %% Return messages in the order they got discarded originally
+    %% for the final at-most-once dead-lettering.
+    CheckedReasonMsgs = case Consumer of
+                            #dlx_consumer{checked_out = Checked} when is_map(Checked) ->
+                                L0 = maps:to_list(Checked),
+                                L1 = lists:keysort(1, L0),
+                                {_, L2} = lists:unzip(L1),
+                                L2;
+                            _ ->
+                                []
+                        end,
+    DiscardReasonMsgs = lqueue:to_list(Discards),
+    CheckedReasonMsgs ++ DiscardReasonMsgs.

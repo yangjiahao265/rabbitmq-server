@@ -61,6 +61,7 @@
           consumed_at :: integer()
          }).
 
+%%TODO export overview and don't dump state's messages binary data
 -record(state, {
           registered_name :: atom(),
           %% In this version of the module, we have one rabbit_fifo_dlx_worker per source quorum queue
