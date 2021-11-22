@@ -1,6 +1,7 @@
 -module(rabbit_fifo_dlx_client).
 
--export([checkout/4, settle/2, handle_ra_event/3]).
+-export([checkout/4, settle/2, handle_ra_event/3,
+         overview/1]).
 
 -record(state,{
           queue_resource :: rabbit_tyes:r(queue),
@@ -89,3 +90,8 @@ transform_msgs(QRes, Msgs) ->
       fun({MsgId, {Reason, _MsgHeader, Msg}}) ->
               {QRes, MsgId, Msg, Reason}
       end, Msgs).
+
+overview(#state{leader = Leader,
+                last_msg_id = LastMsgId}) ->
+    #{leader => Leader,
+      last_msg_id => LastMsgId}.

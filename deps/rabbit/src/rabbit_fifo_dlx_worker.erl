@@ -22,7 +22,7 @@
 %% gen_server2 callbacks
 -export([init/1, terminate/2, handle_continue/2,
          handle_cast/2, handle_call/3, handle_info/2,
-         code_change/3]).
+         code_change/3, format_status/2]).
 
 %%TODO make configurable or leave at 0 which means 2000 as in
 %% https://github.com/rabbitmq/rabbitmq-server/blob/1e7df8c436174735b1d167673afd3f1642da5cdc/deps/rabbit/src/rabbit_quorum_queue.erl#L726-L729
@@ -61,7 +61,6 @@
           consumed_at :: integer()
          }).
 
-%%TODO export overview and don't dump state's messages binary data
 -record(state, {
           registered_name :: atom(),
           %% In this version of the module, we have one rabbit_fifo_dlx_worker per source quorum queue
@@ -83,7 +82,7 @@
           %% redelivering messages for which not all publisher confirms were received.
           %% If there are no pending messages, this timer will eventually be cancelled to allow
           %% this worker to hibernate.
-          timer :: reference()
+          timer :: undefined | reference()
          }).
 
 % -type state() :: #state{}.
@@ -502,3 +501,41 @@ maybe_cancel_timer(#state{timer = TRef,
         _ ->
             State
     end.
+
+%% Avoids large message contents being logged.
+format_status(_Opt, [_PDict, #state{
+                                registered_name = RegisteredName,
+                                queue_ref = QueueRef,
+                                exchange_ref = ExchangeRef,
+                                routing_key = RoutingKey,
+                                dlx_client_state = DlxClientState,
+                                queue_type_state = QueueTypeState,
+                                pendings = Pendings,
+                                next_out_seq = NextOutSeq,
+                                timer = Timer
+                               }]) ->
+    S = #{registered_name => RegisteredName,
+          queue_ref => QueueRef,
+          exchange_ref => ExchangeRef,
+          routing_key => RoutingKey,
+          dlx_client_state => rabbit_fifo_dlx_client:overview(DlxClientState),
+          queue_type_state => QueueTypeState,
+          pendings => maps:map(fun(_, P) -> format_pending(P) end, Pendings),
+          next_out_seq => NextOutSeq,
+          timer_is_active => Timer =/= undefined},
+    [{data, [{"State", S}]}].
+
+format_pending(#pending{consumed_msg_id = ConsumedMsgId,
+                        reason = Reason,
+                        unsettled = Unsettled,
+                        settled = Settled,
+                        publish_count = PublishCount,
+                        last_published_at = LastPublishedAt,
+                        consumed_at = ConsumedAt}) ->
+    #{consumed_msg_id => ConsumedMsgId,
+      reason => Reason,
+      unsettled => Unsettled,
+      settled => Settled,
+      publish_count => PublishCount,
+      last_published_at => LastPublishedAt,
+      consumed_at => ConsumedAt}.

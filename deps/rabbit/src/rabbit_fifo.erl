@@ -597,7 +597,9 @@ apply(#{index := Idx} = Meta, #update_config{config = Conf},
                                  State2 = State1#?MODULE{dlx = rabbit_fifo_dlx:init(),
                                                          ra_indexes = Indexes,
                                                          messages_total = Tot - Len},
-                                 {State2, Effects0}
+                                 {State2, Effects0};
+                             _ ->
+                                 {State1, []}
                          end,
     {State, Reply, Effects} = checkout(Meta, State0, State3, Effects1),
     update_smallest_raft_index(Idx, Reply, State, Effects);
