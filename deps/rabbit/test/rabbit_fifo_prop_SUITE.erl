@@ -1121,6 +1121,16 @@ validate_idx_order(Idxs, ReleaseCursorIdx) ->
             ok
     end.
 
+%%TODO write separate generator for dlx using single_active_prop() or
+%% messages_total_prop() as base template.
+%%
+%% E.g. enqueue few messages and have a consumer rejecting those.
+%% The invariant could be: Delivery effects to dlx_worker must match the number of dead-lettered messages.
+%%
+%% Other invariants could be:
+%% * if new consumer subscribes, messages are checked out to new consumer
+%% * if dlx_worker fails receiving DOWN, messages are still in state.
+
 single_active_prop(Conf0, Commands, ValidateOrder) ->
     Conf = Conf0#{release_cursor_interval => 100},
     Indexes = lists:seq(1, length(Commands)),

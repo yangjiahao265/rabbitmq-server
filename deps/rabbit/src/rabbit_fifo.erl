@@ -570,6 +570,7 @@ apply(#{index := Idx} = Meta, #update_config{config = Conf},
              dlx = DlxState,
              ra_indexes = Indexes0,
              messages_total = Tot} = State1 = update_config(Conf, State0),
+    %%TODO return aux effect here and move logic over to handle_aux/6 which can return effects as last arguments.
     {State3, Effects1} = case DLH of
                              at_least_once ->
                                  case rabbit_fifo_dlx:consumer_pid(DlxState) of
@@ -1633,7 +1634,7 @@ dead_letter_effects(Reason, Discarded,
                          {true, RaftIdx};
                      ({_PerMsgReason, ?INDEX_MSG(RaftIdx, ?DISK_MSG(_Header))}) when Reason =:= undefined ->
                          {true, RaftIdx};
-                     (_) ->
+                     (_IgnorePrefixMessage) ->
                          false
                  end, Discarded),
     [{log, RaftIdxs,
@@ -1650,7 +1651,7 @@ dead_letter_effects(Reason, Discarded,
                                       {true, {PerMsgReason, Msg}};
                                   ({PerMsgReason, ?INDEX_MSG(_, ?MSG(_Header, Msg))}) when Reason =:= undefined ->
                                       {true, {PerMsgReason, Msg}};
-                                  (_) ->
+                                  (_IgnorePrefixMessage) ->
                                       false
                               end, Discarded),
               [{mod_call, Mod, Fun, Args ++ [DeadLetters]}]
@@ -1864,6 +1865,10 @@ checkout0(Meta, {success, ConsumerId, MsgId,
     checkout0(Meta, checkout_one(Meta, State, Effects), SendAcc);
 checkout0(Meta, {success, _ConsumerId, _MsgId, ?TUPLE(_, _), State, Effects},
           SendAcc) ->
+    %% Do not append delivery effect for prefix messages.
+    %% Prefix messages do not exist anymore, but they still go through the
+    %% normal checkout flow to derive correct consumer states
+    %% after recovery and will still be settled or discarded later on.
     checkout0(Meta, checkout_one(Meta, State, Effects), SendAcc);
 checkout0(_Meta, {Activity, State0, Effects0}, SendAcc) ->
     Effects1 = case Activity of
@@ -2085,7 +2090,7 @@ checkout_one(#{system_time := Ts} = Meta, InitState0, Effects0) ->
 expire_msgs(RaCmdTs, State0, Effects0) ->
     case take_next_msg(State0) of
         {?INDEX_MSG(Idx, ?MSG(#{expiry := Expiry} = Header, _) = Msg) = FullMsg, State1}
-          when is_number(Expiry), RaCmdTs >= Expiry ->
+          when is_number(Expiry), RaCmdTs >= Expiry -> %%TODO RaCmdTs > Expiry is good enough to not treat TTL=0 special
             #?MODULE{dlx = DlxState0,
                      cfg = #cfg{dead_letter_handler = DLH},
                      ra_indexes = Indexes0} = State2 = add_bytes_drop(Header, State1),
@@ -2131,6 +2136,7 @@ timer_effect(RaCmdTs, State, Effects) ->
     [{timer, expire_msgs, T} | Effects].
 
 
+%%TODO Do not treat TTL=0 special.
 %%TODO instead of this method, check in expire_msgs() whether checkout Raft command ID
 %% is same as enqueue Raft command ID. If not, remove.
 %%

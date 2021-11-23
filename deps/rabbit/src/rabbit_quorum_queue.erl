@@ -1247,6 +1247,7 @@ dead_letter_handler(Q, Overflow) ->
     %%TODO policy having precedence is a behaviour change. Check if that's okay.
     %% Policy needs to have precedence for at-least-once to allow to dynamically
     %% fix dead-letter routing topologies for a queue.
+    %% A: Do not change precedence.
     Exchange = args_policy_lookup(<<"dead-letter-exchange">>, fun policyHasPrecedence/2, Q),
     RoutingKey = args_policy_lookup(<<"dead-letter-routing-key">>, fun policyHasPrecedence/2, Q),
     Strategy = args_policy_lookup(<<"dead-letter-strategy">>, fun policyHasPrecedence/2, Q),
