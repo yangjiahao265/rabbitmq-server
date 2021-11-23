@@ -769,7 +769,10 @@ open(info, {OK, S, Data},
              StatemData#statem_data{connection = Connection1,
                                     connection_state = State2}}
     end;
-open(info, {sac, {{subscription_id, SubId}, {active, Active}}},
+open(info,
+     {sac,
+      {{subscription_id, SubId}, {active, Active},
+       {side_effects, Effects}}},
      #statem_data{transport = Transport,
                   connection = Connection0,
                   connection_state = ConnState0} =
@@ -787,7 +790,8 @@ open(info, {sac, {{subscription_id, SubId}, {active, Active}}},
                                           Connection0,
                                           SubId,
                                           Active,
-                                          true),
+                                          true,
+                                          Effects),
                 {Conn1,
                  ConnState0#stream_connection_state{consumers =
                                                         Consumers0#{SubId =>
@@ -1850,6 +1854,11 @@ handle_frame_post_auth(Transport,
                             ConsumerCounters =
                                 atomics:new(2, [{signed, false}]),
 
+                            response_ok(Transport,
+                                        Connection,
+                                        subscribe,
+                                        CorrelationId),
+
                             Active =
                                 maybe_register_consumer(VirtualHost,
                                                         Stream,
@@ -1857,13 +1866,6 @@ handle_frame_post_auth(Transport,
                                                         SubscriptionId,
                                                         Properties,
                                                         Sac),
-
-                            Connection1 =
-                                maybe_notify_consumer(Transport,
-                                                      Connection,
-                                                      SubscriptionId,
-                                                      Active,
-                                                      Sac),
 
                             ConsumerState =
                                 #consumer{member_pid = LocalMemberPid,
@@ -1877,20 +1879,15 @@ handle_frame_post_auth(Transport,
                                           properties = Properties,
                                           active = Active},
 
-                            Connection2 =
+                            Connection1 =
                                 maybe_monitor_stream(LocalMemberPid, Stream,
-                                                     Connection1),
-
-                            response_ok(Transport,
-                                        Connection,
-                                        subscribe,
-                                        CorrelationId),
+                                                     Connection),
 
                             State1 =
                                 maybe_dispatch_on_subscription(Transport,
                                                                State,
                                                                ConsumerState,
-                                                               Connection2,
+                                                               Connection1,
                                                                Consumers,
                                                                Stream,
                                                                SubscriptionId,
@@ -1907,7 +1904,7 @@ handle_frame_post_auth(Transport,
                                         StreamSubscriptions#{Stream =>
                                                                  [SubscriptionId]}
                                 end,
-                            {Connection2#stream_connection{stream_subscriptions
+                            {Connection1#stream_connection{stream_subscriptions
                                                                =
                                                                StreamSubscriptions1},
                              State1}
@@ -2400,7 +2397,8 @@ handle_frame_post_auth(Transport,
                          ResponseOffsetSpec}}) ->
     %% FIXME check response code? It's supposed to be OK all the time.
     case maps:take(CorrelationId, Requests0) of
-        {{{subscription_id, SubscriptionId}}, Rs} ->
+        {{{subscription_id, SubscriptionId}, {side_effects, _SideEffects}},
+         Rs} ->
             rabbit_log:debug("Received consumer update response for subscription ~p",
                              [SubscriptionId]),
             Consumers1 =
@@ -2634,7 +2632,7 @@ maybe_register_consumer(VirtualHost,
                                                         SubscriptionId),
     Active.
 
-maybe_notify_consumer(_, Connection, _, _, false = _Sac) ->
+maybe_notify_consumer(_, Connection, _, _, _, false = _Sac) ->
     Connection;
 maybe_notify_consumer(Transport,
                       #stream_connection{socket = S,
@@ -2644,7 +2642,8 @@ maybe_notify_consumer(Transport,
                           Connection,
                       SubscriptionId,
                       Active,
-                      true = _Sac) ->
+                      true = _Sac,
+                      SideEffects) ->
     rabbit_log:debug("SAC subscription ~p, active = ~p",
                      [SubscriptionId, Active]),
     Frame =
@@ -2652,7 +2651,9 @@ maybe_notify_consumer(Transport,
                                   {consumer_update, SubscriptionId, Active}}),
 
     OutstandingRequests1 =
-        maps:put(CorrIdSeq, {{subscription_id, SubscriptionId}},
+        maps:put(CorrIdSeq,
+                 {{subscription_id, SubscriptionId},
+                  {side_effects, SideEffects}},
                  OutstandingRequests0),
     send(Transport, S, Frame),
     Connection#stream_connection{correlation_id_sequence = CorrIdSeq + 1,
