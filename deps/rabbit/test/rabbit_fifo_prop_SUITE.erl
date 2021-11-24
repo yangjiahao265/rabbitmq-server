@@ -10,6 +10,9 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("rabbit/src/rabbit_fifo.hrl").
+-include_lib("rabbit/src/rabbit_fifo_dlx.hrl").
+-include_lib("rabbit_common/include/rabbit.hrl").
+-include_lib("rabbit_common/include/rabbit_framing.hrl").
 
 %%%===================================================================
 %%% Common Test callbacks
@@ -25,7 +28,6 @@ all_tests() ->
     [
      test_run_log,
      snapshots,
-     scenario1,
      scenario2,
      scenario3,
      scenario4,
@@ -69,7 +71,8 @@ all_tests() ->
      single_active_ordering_01,
      single_active_ordering_03,
      in_memory_limit,
-     max_length
+     max_length,
+     dlx_01
      % single_active_ordering_02
     ].
 
@@ -103,32 +106,14 @@ end_per_testcase(_TestCase, _Config) ->
 % -type log_op() ::
 %     {enqueue, pid(), maybe(msg_seqno()), Msg :: raw_msg()}.
 
-scenario1(_Config) ->
-    C1 = {<<>>, c:pid(0,6723,1)},
-    C2 = {<<0>>,c:pid(0,6723,1)},
-    E = c:pid(0,6720,1),
-
-    Commands = [
-                make_checkout(C1, {auto,2,simple_prefetch}),
-                make_enqueue(E,1,msg1),
-                make_enqueue(E,2,msg2),
-                make_checkout(C1, cancel), %% both on returns queue
-                make_checkout(C2, {auto,1,simple_prefetch}),
-                make_return(C2, [0]), %% E1 in returns, E2 with C2
-                make_return(C2, [1]), %% E2 in returns E1 with C2
-                make_settle(C2, [2]) %% E2 with C2
-               ],
-    run_snapshot_test(#{name => ?FUNCTION_NAME}, Commands),
-    ok.
-
 scenario2(_Config) ->
     C1 = {<<>>, c:pid(0,346,1)},
     C2 = {<<>>,c:pid(0,379,1)},
     E = c:pid(0,327,1),
     Commands = [make_checkout(C1, {auto,1,simple_prefetch}),
-                make_enqueue(E,1,msg1),
+                make_enqueue(E,1,msg(<<"msg1">>)),
                 make_checkout(C1, cancel),
-                make_enqueue(E,2,msg2),
+                make_enqueue(E,2,msg(<<"msg2">>)),
                 make_checkout(C2, {auto,1,simple_prefetch}),
                 make_settle(C1, [0]),
                 make_settle(C2, [0])
@@ -140,10 +125,10 @@ scenario3(_Config) ->
     C1 = {<<>>, c:pid(0,179,1)},
     E = c:pid(0,176,1),
     Commands = [make_checkout(C1, {auto,2,simple_prefetch}),
-                make_enqueue(E,1,msg1),
+                make_enqueue(E,1,msg(<<"msg1">>)),
                 make_return(C1, [0]),
-                make_enqueue(E,2,msg2),
-                make_enqueue(E,3,msg3),
+                make_enqueue(E,2,msg(<<"msg2">>)),
+                make_enqueue(E,3,msg(<<"msg3">>)),
                 make_settle(C1, [1]),
                 make_settle(C1, [2])
                ],
@@ -154,7 +139,7 @@ scenario4(_Config) ->
     C1 = {<<>>, c:pid(0,179,1)},
     E = c:pid(0,176,1),
     Commands = [make_checkout(C1, {auto,1,simple_prefetch}),
-                make_enqueue(E,1,msg),
+                make_enqueue(E,1,msg(<<"msg">>)),
                 make_settle(C1, [0])
                ],
     run_snapshot_test(#{name => ?FUNCTION_NAME}, Commands),
@@ -163,17 +148,17 @@ scenario4(_Config) ->
 scenario5(_Config) ->
     C1 = {<<>>, c:pid(0,505,0)},
     E = c:pid(0,465,9),
-    Commands = [make_enqueue(E,1,<<0>>),
+    Commands = [make_enqueue(E,1,msg(<<0>>)),
                 make_checkout(C1, {auto,1,simple_prefetch}),
-                make_enqueue(E,2,<<>>),
+                make_enqueue(E,2,msg(<<>>)),
                 make_settle(C1,[0])],
     run_snapshot_test(#{name => ?FUNCTION_NAME}, Commands),
     ok.
 
 scenario6(_Config) ->
     E = c:pid(0,465,9),
-    Commands = [make_enqueue(E,1,<<>>), %% 1 msg on queue - snap: prefix 1
-                make_enqueue(E,2,<<>>) %% 1. msg on queue - snap: prefix 1
+    Commands = [make_enqueue(E,1,msg(<<>>)), %% 1 msg on queue - snap: prefix 1
+                make_enqueue(E,2,msg(<<>>)) %% 1. msg on queue - snap: prefix 1
                ],
     run_snapshot_test(#{name => ?FUNCTION_NAME,
                         max_length => 1}, Commands),
@@ -183,10 +168,10 @@ scenario7(_Config) ->
     C1 = {<<>>, c:pid(0,208,0)},
     E = c:pid(0,188,0),
     Commands = [
-                make_enqueue(E,1,<<>>),
+                make_enqueue(E,1,msg(<<>>)),
                 make_checkout(C1, {auto,1,simple_prefetch}),
-                make_enqueue(E,2,<<>>),
-                make_enqueue(E,3,<<>>),
+                make_enqueue(E,2,msg(<<>>)),
+                make_enqueue(E,3,msg(<<>>)),
                 make_settle(C1,[0])],
     run_snapshot_test(#{name => ?FUNCTION_NAME,
                         max_length => 1}, Commands),
@@ -196,8 +181,8 @@ scenario8(_Config) ->
     C1 = {<<>>, c:pid(0,208,0)},
     E = c:pid(0,188,0),
     Commands = [
-                make_enqueue(E,1,<<>>),
-                make_enqueue(E,2,<<>>),
+                make_enqueue(E,1,msg(<<>>)),
+                make_enqueue(E,2,msg(<<>>)),
                 make_checkout(C1, {auto,1,simple_prefetch}),
                 % make_checkout(C1, cancel),
                 {down, E, noconnection},
@@ -209,9 +194,9 @@ scenario8(_Config) ->
 scenario9(_Config) ->
     E = c:pid(0,188,0),
     Commands = [
-                make_enqueue(E,1,<<>>),
-                make_enqueue(E,2,<<>>),
-                make_enqueue(E,3,<<>>)],
+                make_enqueue(E,1,msg(<<>>)),
+                make_enqueue(E,2,msg(<<>>)),
+                make_enqueue(E,3,msg(<<>>))],
     run_snapshot_test(#{name => ?FUNCTION_NAME,
                         max_length => 1}, Commands),
     ok.
@@ -221,7 +206,7 @@ scenario10(_Config) ->
     E = c:pid(0,188,0),
     Commands = [
                 make_checkout(C1, {auto,1,simple_prefetch}),
-                make_enqueue(E,1,<<>>),
+                make_enqueue(E,1,msg(<<>>)),
                 make_settle(C1, [0])
                ],
     run_snapshot_test(#{name => ?FUNCTION_NAME,
@@ -232,10 +217,10 @@ scenario11(_Config) ->
     C1 = {<<>>, c:pid(0,215,0)},
     E = c:pid(0,217,0),
     Commands = [
-                make_enqueue(E,1,<<"1">>), % 1
+                make_enqueue(E,1,msg(<<"1">>)), % 1
                 make_checkout(C1, {auto,1,simple_prefetch}), % 2
                 make_checkout(C1, cancel), % 3
-                make_enqueue(E,2,<<"22">>), % 4
+                make_enqueue(E,2,msg(<<"22">>)), % 4
                 make_checkout(C1, {auto,1,simple_prefetch}), % 5
                 make_settle(C1, [0]), % 6
                 make_checkout(C1, cancel) % 7
@@ -246,19 +231,19 @@ scenario11(_Config) ->
 
 scenario12(_Config) ->
     E = c:pid(0,217,0),
-    Commands = [make_enqueue(E,1,<<0>>),
-                make_enqueue(E,2,<<0>>),
-                make_enqueue(E,3,<<0>>)],
+    Commands = [make_enqueue(E,1,msg(<<0>>)),
+                make_enqueue(E,2,msg(<<0>>)),
+                make_enqueue(E,3,msg(<<0>>))],
     run_snapshot_test(#{name => ?FUNCTION_NAME,
                         max_bytes => 2}, Commands),
     ok.
 
 scenario13(_Config) ->
     E = c:pid(0,217,0),
-    Commands = [make_enqueue(E,1,<<0>>),
-                make_enqueue(E,2,<<>>),
-                make_enqueue(E,3,<<>>),
-                make_enqueue(E,4,<<>>)
+    Commands = [make_enqueue(E,1,msg(<<0>>)),
+                make_enqueue(E,2,msg(<<>>)),
+                make_enqueue(E,3,msg(<<>>)),
+                make_enqueue(E,4,msg(<<>>))
                ],
     run_snapshot_test(#{name => ?FUNCTION_NAME,
                         max_length => 2}, Commands),
@@ -266,7 +251,7 @@ scenario13(_Config) ->
 
 scenario14(_Config) ->
     E = c:pid(0,217,0),
-    Commands = [make_enqueue(E,1,<<0,0>>)],
+    Commands = [make_enqueue(E,1,msg(<<0,0>>))],
     run_snapshot_test(#{name => ?FUNCTION_NAME,
                         max_bytes => 1}, Commands),
     ok.
@@ -274,8 +259,8 @@ scenario14(_Config) ->
 scenario14b(_Config) ->
     E = c:pid(0,217,0),
     Commands = [
-                make_enqueue(E,1,<<0>>),
-                make_enqueue(E,2,<<0>>)
+                make_enqueue(E,1,msg(<<0>>)),
+                make_enqueue(E,2,msg(<<0>>))
                ],
     run_snapshot_test(#{name => ?FUNCTION_NAME,
                         max_bytes => 1}, Commands),
@@ -285,8 +270,8 @@ scenario15(_Config) ->
     C1 = {<<>>, c:pid(0,179,1)},
     E = c:pid(0,176,1),
     Commands = [make_checkout(C1, {auto,2,simple_prefetch}),
-                make_enqueue(E, 1, msg1),
-                make_enqueue(E, 2, msg2),
+                make_enqueue(E, 1, msg(<<"msg1">>)),
+                make_enqueue(E, 2, msg(<<"msg2">>)),
                 make_return(C1, [0]),
                 make_return(C1, [2]),
                 make_settle(C1, [1])
@@ -302,11 +287,11 @@ scenario16(_Config) ->
     E = c:pid(0,176,1),
     Commands = [
                 make_checkout(C1, {auto,1,simple_prefetch}),
-                make_enqueue(E, 1, msg1),
+                make_enqueue(E, 1, msg(<<"msg1">>)),
                 make_checkout(C2, {auto,1,simple_prefetch}),
                 {down, C1Pid, noproc}, %% msg1 allocated to C2
                 make_return(C2, [0]), %% msg1 returned
-                make_enqueue(E, 2, <<>>),
+                make_enqueue(E, 2, msg(<<>>)),
                 make_settle(C2, [0])
                ],
     run_snapshot_test(#{name => ?FUNCTION_NAME,
@@ -321,11 +306,11 @@ scenario17(_Config) ->
     E = test_util:fake_pid(rabbit@fake_node2),
     Commands = [
                 make_checkout(C1, {auto,1,simple_prefetch}),
-                make_enqueue(E,1,<<"one">>),
+                make_enqueue(E,1,msg(<<"one">>)),
                 make_checkout(C2, {auto,1,simple_prefetch}),
                 {down, C1Pid, noconnection},
                 make_checkout(C2, cancel),
-                make_enqueue(E,2,<<"two">>),
+                make_enqueue(E,2,msg(<<"two">>)),
                 {nodeup,rabbit@fake_node1},
                 %% this has no effect as was returned
                 make_settle(C1, [0]),
@@ -339,11 +324,11 @@ scenario17(_Config) ->
 
 scenario18(_Config) ->
     E = c:pid(0,176,1),
-    Commands = [make_enqueue(E,1,<<"1">>),
-                make_enqueue(E,2,<<"2">>),
-                make_enqueue(E,3,<<"3">>),
-                make_enqueue(E,4,<<"4">>),
-                make_enqueue(E,5,<<"5">>)
+    Commands = [make_enqueue(E,1,msg(<<"1">>)),
+                make_enqueue(E,2,msg(<<"2">>)),
+                make_enqueue(E,3,msg(<<"3">>)),
+                make_enqueue(E,4,msg(<<"4">>)),
+                make_enqueue(E,5,msg(<<"5">>))
                ],
     run_snapshot_test(#{name => ?FUNCTION_NAME,
                         %% max_length => 3,
@@ -354,10 +339,10 @@ scenario19(_Config) ->
     C1Pid = c:pid(0,883,1),
     C1 = {<<>>, C1Pid},
     E = c:pid(0,176,1),
-    Commands = [make_enqueue(E,1,<<"1">>),
-                make_enqueue(E,2,<<"2">>),
+    Commands = [make_enqueue(E,1,msg(<<"1">>)),
+                make_enqueue(E,2,msg(<<"2">>)),
                 make_checkout(C1, {auto,2,simple_prefetch}),
-                make_enqueue(E,3,<<"3">>),
+                make_enqueue(E,3,msg(<<"3">>)),
                 make_settle(C1, [0, 1])
                ],
     run_snapshot_test(#{name => ?FUNCTION_NAME,
@@ -369,15 +354,15 @@ scenario20(_Config) ->
     C1Pid = c:pid(0,883,1),
     C1 = {<<>>, C1Pid},
     E = c:pid(0,176,1),
-    Commands = [make_enqueue(E,1,<<>>),
-                make_enqueue(E,2,<<1>>),
+    Commands = [make_enqueue(E,1,msg(<<>>)),
+                make_enqueue(E,2,msg(<<1>>)),
                 make_checkout(C1, {auto,2,simple_prefetch}),
                 {down, C1Pid, noconnection},
-                make_enqueue(E,3,<<0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0>>),
-                make_enqueue(E,4,<<0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0>>),
-                make_enqueue(E,5,<<0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0>>),
-                make_enqueue(E,6,<<0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0>>),
-                make_enqueue(E,7,<<0,0,0,0,0,0,0,0,0,0,0,0,0,0>>)
+                make_enqueue(E,3,msg(<<0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0>>)),
+                make_enqueue(E,4,msg(<<0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0>>)),
+                make_enqueue(E,5,msg(<<0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0>>)),
+                make_enqueue(E,6,msg(<<0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0>>)),
+                make_enqueue(E,7,msg(<<0,0,0,0,0,0,0,0,0,0,0,0,0,0>>))
                ],
     run_snapshot_test(#{name => ?FUNCTION_NAME,
                         max_length => 4,
@@ -391,15 +376,15 @@ scenario21(_Config) ->
     E = c:pid(0,176,1),
     Commands = [
                 make_checkout(C1, {auto,2,simple_prefetch}),
-                make_enqueue(E,1,<<"1">>),
-                make_enqueue(E,2,<<"2">>),
-                make_enqueue(E,3,<<"3">>),
+                make_enqueue(E,1,msg(<<"1">>)),
+                make_enqueue(E,2,msg(<<"2">>)),
+                make_enqueue(E,3,msg(<<"3">>)),
                 rabbit_fifo:make_discard(C1, [0]),
                 rabbit_fifo:make_settle(C1, [1])
                ],
     run_snapshot_test(#{name => ?FUNCTION_NAME,
                         release_cursor_interval => 1,
-                        dead_letter_handler => {?MODULE, banana, []}},
+                        dead_letter_handler => {at_most_once, {?MODULE, banana, []}}},
                       Commands),
     ok.
 
@@ -408,16 +393,16 @@ scenario22(_Config) ->
     % C1 = {<<>>, C1Pid},
     E = c:pid(0,176,1),
     Commands = [
-                make_enqueue(E,1,<<"1">>),
-                make_enqueue(E,2,<<"2">>),
-                make_enqueue(E,3,<<"3">>),
-                make_enqueue(E,4,<<"4">>),
-                make_enqueue(E,5,<<"5">>)
+                make_enqueue(E,1,msg(<<"1">>)),
+                make_enqueue(E,2,msg(<<"2">>)),
+                make_enqueue(E,3,msg(<<"3">>)),
+                make_enqueue(E,4,msg(<<"4">>)),
+                make_enqueue(E,5,msg(<<"5">>))
                ],
     run_snapshot_test(#{name => ?FUNCTION_NAME,
                         release_cursor_interval => 1,
                         max_length => 3,
-                        dead_letter_handler => {?MODULE, banana, []}},
+                        dead_letter_handler => {at_most_once, {?MODULE, banana, []}}},
                       Commands),
     ok.
 
@@ -429,10 +414,10 @@ scenario24(_Config) ->
     Commands = [
                 make_checkout(C1, {auto,2,simple_prefetch}), %% 1
                 make_checkout(C2, {auto,1,simple_prefetch}), %% 2
-                make_enqueue(E,1,<<"1">>), %% 3
-                make_enqueue(E,2,<<"2b">>), %% 4
-                make_enqueue(E,3,<<"3">>), %% 5
-                make_enqueue(E,4,<<"4">>), %% 6
+                make_enqueue(E,1,msg(<<"1">>)), %% 3
+                make_enqueue(E,2,msg(<<"2b">>)), %% 4
+                make_enqueue(E,3,msg(<<"3">>)), %% 5
+                make_enqueue(E,4,msg(<<"4">>)), %% 6
                 {down, E, noconnection} %% 7
                ],
     run_snapshot_test(#{name => ?FUNCTION_NAME,
@@ -440,7 +425,7 @@ scenario24(_Config) ->
                         deliver_limit => undefined,
                         max_length => 3,
                         overflow_strategy => drop_head,
-                        dead_letter_handler => {?MODULE, banana, []}
+                        dead_letter_handler => {at_most_once, {?MODULE, banana, []}}
                        },
                       Commands),
     ok.
@@ -453,12 +438,12 @@ scenario25(_Config) ->
     E = c:pid(0,280,0),
     Commands = [
                 make_checkout(C1, {auto,2,simple_prefetch}), %% 1
-                make_enqueue(E,1,<<0>>), %% 2
+                make_enqueue(E,1,msg(<<0>>)), %% 2
                 make_checkout(C2, {auto,1,simple_prefetch}), %% 3
-                make_enqueue(E,2,<<>>), %% 4
-                make_enqueue(E,3,<<>>), %% 5
+                make_enqueue(E,2,msg(<<>>)), %% 4
+                make_enqueue(E,3,msg(<<>>)), %% 5
                 {down, C1Pid, noproc}, %% 6
-                make_enqueue(E,4,<<>>), %% 7
+                make_enqueue(E,4,msg(<<>>)), %% 7
                 rabbit_fifo:make_purge() %% 8
                ],
     run_snapshot_test(#{name => ?FUNCTION_NAME,
@@ -466,7 +451,7 @@ scenario25(_Config) ->
                         release_cursor_interval => 0,
                         deliver_limit => undefined,
                         overflow_strategy => drop_head,
-                        dead_letter_handler => {?MODULE, banana, []}
+                        dead_letter_handler => {at_most_once, {?MODULE, banana, []}}
                        },
                       Commands),
     ok.
@@ -477,19 +462,19 @@ scenario26(_Config) ->
     E1 = c:pid(0,436,0),
     E2 = c:pid(0,435,0),
     Commands = [
-                make_enqueue(E1,2,<<>>), %% 1
-                make_enqueue(E1,3,<<>>), %% 2
-                make_enqueue(E2,1,<<>>), %% 3
-                make_enqueue(E2,2,<<>>), %% 4
-                make_enqueue(E1,4,<<>>), %% 5
-                make_enqueue(E1,5,<<>>), %% 6
-                make_enqueue(E1,6,<<>>), %% 7
-                make_enqueue(E1,7,<<>>), %% 8
-                make_enqueue(E1,1,<<>>), %% 9
+                make_enqueue(E1,2,msg(<<>>)), %% 1
+                make_enqueue(E1,3,msg(<<>>)), %% 2
+                make_enqueue(E2,1,msg(<<>>)), %% 3
+                make_enqueue(E2,2,msg(<<>>)), %% 4
+                make_enqueue(E1,4,msg(<<>>)), %% 5
+                make_enqueue(E1,5,msg(<<>>)), %% 6
+                make_enqueue(E1,6,msg(<<>>)), %% 7
+                make_enqueue(E1,7,msg(<<>>)), %% 8
+                make_enqueue(E1,1,msg(<<>>)), %% 9
                 make_checkout(C1, {auto,5,simple_prefetch}), %% 1
-                make_enqueue(E1,8,<<>>), %% 2
-                make_enqueue(E1,9,<<>>), %% 2
-                make_enqueue(E1,10,<<>>), %% 2
+                make_enqueue(E1,8,msg(<<>>)), %% 2
+                make_enqueue(E1,9,msg(<<>>)), %% 2
+                make_enqueue(E1,10,msg(<<>>)), %% 2
                 {down, C1Pid, noconnection}
                ],
     run_snapshot_test(#{name => ?FUNCTION_NAME,
@@ -497,22 +482,22 @@ scenario26(_Config) ->
                         deliver_limit => undefined,
                         max_length => 8,
                         overflow_strategy => drop_head,
-                        dead_letter_handler => {?MODULE, banana, []}
+                        dead_letter_handler => {at_most_once, {?MODULE, banana, []}}
                        },
                       Commands),
     ok.
 
 scenario28(_Config) ->
     E = c:pid(0,151,0),
-    Conf = #{dead_letter_handler => {rabbit_fifo_prop_SUITE,banana,[]},
+    Conf = #{dead_letter_handler => {at_most_once, {rabbit_fifo_prop_SUITE,banana,[]}},
              delivery_limit => undefined,
              max_in_memory_bytes => undefined,
              max_length => 1,name => ?FUNCTION_NAME,overflow_strategy => drop_head,
              release_cursor_interval => 100,single_active_consumer_on => false},
     Commands = [
-                make_enqueue(E,2, <<>>),
-                make_enqueue(E,3, <<>>),
-                make_enqueue(E,1, <<>>)
+                make_enqueue(E,2,msg( <<>>)),
+                make_enqueue(E,3,msg( <<>>)),
+                make_enqueue(E,1,msg( <<>>))
                ],
     ?assert(single_active_prop(Conf, Commands, false)),
     ok.
@@ -525,39 +510,39 @@ scenario27(_Config) ->
     E = c:pid(0,151,0),
     E2 = c:pid(0,152,0),
     Commands = [
-                make_enqueue(E,1,<<>>),
-                make_enqueue(E2,1,<<28,202>>),
-                make_enqueue(E,2,<<"Î2">>),
+                make_enqueue(E,1,msg(<<>>)),
+                make_enqueue(E2,1,msg(<<28,202>>)),
+                make_enqueue(E,2,msg(<<"Î2">>)),
                 {down, E, noproc},
-                make_enqueue(E2,2,<<"ê">>),
+                make_enqueue(E2,2,msg(<<"ê">>)),
                 {nodeup,fakenode@fake},
-                make_enqueue(E2,3,<<>>),
-                make_enqueue(E2,4,<<>>),
-                make_enqueue(E2,5,<<>>),
-                make_enqueue(E2,6,<<>>),
-                make_enqueue(E2,7,<<>>),
-                make_enqueue(E2,8,<<>>),
-                make_enqueue(E2,9,<<>>),
+                make_enqueue(E2,3,msg(<<>>)),
+                make_enqueue(E2,4,msg(<<>>)),
+                make_enqueue(E2,5,msg(<<>>)),
+                make_enqueue(E2,6,msg(<<>>)),
+                make_enqueue(E2,7,msg(<<>>)),
+                make_enqueue(E2,8,msg(<<>>)),
+                make_enqueue(E2,9,msg(<<>>)),
                 {purge},
-                make_enqueue(E2,10,<<>>),
-                make_enqueue(E2,11,<<>>),
-                make_enqueue(E2,12,<<>>),
-                make_enqueue(E2,13,<<>>),
-                make_enqueue(E2,14,<<>>),
-                make_enqueue(E2,15,<<>>),
-                make_enqueue(E2,16,<<>>),
-                make_enqueue(E2,17,<<>>),
-                make_enqueue(E2,18,<<>>),
+                make_enqueue(E2,10,msg(<<>>)),
+                make_enqueue(E2,11,msg(<<>>)),
+                make_enqueue(E2,12,msg(<<>>)),
+                make_enqueue(E2,13,msg(<<>>)),
+                make_enqueue(E2,14,msg(<<>>)),
+                make_enqueue(E2,15,msg(<<>>)),
+                make_enqueue(E2,16,msg(<<>>)),
+                make_enqueue(E2,17,msg(<<>>)),
+                make_enqueue(E2,18,msg(<<>>)),
                 {nodeup,fakenode@fake},
-                make_enqueue(E2,19,<<>>),
+                make_enqueue(E2,19,msg(<<>>)),
                 make_checkout(C1, {auto,77,simple_prefetch}),
-                make_enqueue(E2,20,<<>>),
-                make_enqueue(E2,21,<<>>),
-                make_enqueue(E2,22,<<>>),
-                make_enqueue(E2,23,<<"Ýý">>),
+                make_enqueue(E2,20,msg(<<>>)),
+                make_enqueue(E2,21,msg(<<>>)),
+                make_enqueue(E2,22,msg(<<>>)),
+                make_enqueue(E2,23,msg(<<"Ýý">>)),
                 make_checkout(C2, {auto,66,simple_prefetch}),
                 {purge},
-                make_enqueue(E2,24,<<>>)
+                make_enqueue(E2,24,msg(<<>>))
                ],
     ?assert(
        single_active_prop(#{name => ?FUNCTION_NAME,
@@ -569,7 +554,7 @@ scenario27(_Config) ->
                             max_in_memory_bytes => 691,
                             overflow_strategy => drop_head,
                             single_active_consumer_on => true,
-                            dead_letter_handler => {?MODULE, banana, []}
+                            dead_letter_handler => {at_most_once, {?MODULE, banana, []}}
                            }, Commands, false)),
     ok.
 
@@ -578,11 +563,11 @@ scenario30(_Config) ->
     C1 = {<<>>, C1Pid},
     E = c:pid(0,240,0),
     Commands = [
-                make_enqueue(E,1,<<>>), %% 1
-                make_enqueue(E,2,<<1>>), %% 2
+                make_enqueue(E,1,msg(<<>>)), %% 1
+                make_enqueue(E,2,msg(<<1>>)), %% 2
                 make_checkout(C1, {auto,1,simple_prefetch}), %% 3
                 {down, C1Pid, noconnection}, %% 4
-                make_enqueue(E,3,<<>>) %% 5
+                make_enqueue(E,3,msg(<<>>)) %% 5
                ],
     run_snapshot_test(#{name => ?FUNCTION_NAME,
                         release_cursor_interval => 0,
@@ -590,7 +575,7 @@ scenario30(_Config) ->
                         max_length => 1,
                         max_in_memory_length => 1,
                         overflow_strategy => drop_head,
-                        dead_letter_handler => {?MODULE, banana, []},
+                        dead_letter_handler => {at_most_once, {?MODULE, banana, []}},
                         single_active_consumer_on => true
                        },
                       Commands),
@@ -609,8 +594,8 @@ scenario31(_Config) ->
                 %    {auto,1,simple_prefetch},
                 %    #{ack => true,args => [],prefetch => 1,username => <<"user">>}}},
                 %  {4,{purge}}]
-                make_enqueue(E1,1,<<>>), %% 1
-                make_enqueue(E2,2,<<1>>), %% 2
+                make_enqueue(E1,1,msg(<<>>)), %% 1
+                make_enqueue(E2,2,msg(<<1>>)), %% 2
                 make_checkout(C1, {auto,1,simple_prefetch}), %% 3
                 {purge} %% 4
                ],
@@ -618,7 +603,7 @@ scenario31(_Config) ->
                         release_cursor_interval => 0,
                         deliver_limit => undefined,
                         overflow_strategy => drop_head,
-                        dead_letter_handler => {?MODULE, banana, []}
+                        dead_letter_handler => {at_most_once, {?MODULE, banana, []}}
                        },
                       Commands),
     ok.
@@ -626,17 +611,17 @@ scenario31(_Config) ->
 scenario32(_Config) ->
     E1 = c:pid(0,314,0),
     Commands = [
-                make_enqueue(E1,1,<<0>>), %% 1
-                make_enqueue(E1,2,<<0,0>>), %% 2
-                make_enqueue(E1,4,<<0,0,0,0>>), %% 3
-                make_enqueue(E1,3,<<0,0,0>>) %% 4
+                make_enqueue(E1,1,msg(<<0>>)), %% 1
+                make_enqueue(E1,2,msg(<<0,0>>)), %% 2
+                make_enqueue(E1,4,msg(<<0,0,0,0>>)), %% 3
+                make_enqueue(E1,3,msg(<<0,0,0>>)) %% 4
                ],
     run_snapshot_test(#{name => ?FUNCTION_NAME,
                         release_cursor_interval => 0,
                         max_length => 3,
                         deliver_limit => undefined,
                         overflow_strategy => drop_head,
-                        dead_letter_handler => {?MODULE, banana, []}
+                        dead_letter_handler => {at_most_once, {?MODULE, banana, []}}
                        },
                       Commands),
     ok.
@@ -646,14 +631,14 @@ scenario29(_Config) ->
     C1 = {<<>>, C1Pid},
     E = c:pid(0,240,0),
     Commands = [
-                make_enqueue(E,1,<<>>), %% 1
-                make_enqueue(E,2,<<>>), %% 2
+                make_enqueue(E,1,msg(<<>>)), %% 1
+                make_enqueue(E,2,msg(<<>>)), %% 2
                 make_checkout(C1, {auto,2,simple_prefetch}), %% 2
-                make_enqueue(E,3,<<>>), %% 3
-                make_enqueue(E,4,<<>>), %% 4
-                make_enqueue(E,5,<<>>), %% 5
-                make_enqueue(E,6,<<>>), %% 6
-                make_enqueue(E,7,<<>>), %% 7
+                make_enqueue(E,3,msg(<<>>)), %% 3
+                make_enqueue(E,4,msg(<<>>)), %% 4
+                make_enqueue(E,5,msg(<<>>)), %% 5
+                make_enqueue(E,6,msg(<<>>)), %% 6
+                make_enqueue(E,7,msg(<<>>)), %% 7
                 {down, E, noconnection} %% 8
                ],
     run_snapshot_test(#{name => ?FUNCTION_NAME,
@@ -662,7 +647,7 @@ scenario29(_Config) ->
                         max_length => 5,
                         max_in_memory_length => 1,
                         overflow_strategy => drop_head,
-                        dead_letter_handler => {?MODULE, banana, []},
+                        dead_letter_handler => {at_most_once, {?MODULE, banana, []}},
                         single_active_consumer_on => true
                        },
                       Commands),
@@ -672,19 +657,19 @@ scenario23(_Config) ->
     C1 = {<<>>, C1Pid},
     E = c:pid(0,240,0),
     Commands = [
-                make_enqueue(E,1,<<>>), %% 1
+                make_enqueue(E,1,msg(<<>>)), %% 1
                 make_checkout(C1, {auto,2,simple_prefetch}), %% 2
-                make_enqueue(E,2,<<>>), %% 3
-                make_enqueue(E,3,<<>>), %% 4
+                make_enqueue(E,2,msg(<<>>)), %% 3
+                make_enqueue(E,3,msg(<<>>)), %% 4
                 {down, E, noconnection}, %% 5
-                make_enqueue(E,4,<<>>) %% 6
+                make_enqueue(E,4,msg(<<>>)) %% 6
                ],
     run_snapshot_test(#{name => ?FUNCTION_NAME,
                         release_cursor_interval => 0,
                         deliver_limit => undefined,
                         max_length => 2,
                         overflow_strategy => drop_head,
-                        dead_letter_handler => {?MODULE, banana, []}
+                        dead_letter_handler => {at_most_once, {?MODULE, banana, []}}
                        },
                       Commands),
     ok.
@@ -697,7 +682,7 @@ single_active_01(_Config) ->
     E = test_util:fake_pid(rabbit@fake_node2),
     Commands = [
                 make_checkout(C1, {auto,1,simple_prefetch}),
-                make_enqueue(E,1,<<"one">>),
+                make_enqueue(E,1,msg(<<"one">>)),
                 make_checkout(C2, {auto,1,simple_prefetch}),
                 make_checkout(C1, cancel),
                 {nodeup,rabbit@fake_node1}
@@ -716,7 +701,7 @@ single_active_02(_Config) ->
     E = test_util:fake_pid(node()),
     Commands = [
                 make_checkout(C1, {auto,1,simple_prefetch}),
-                make_enqueue(E,1,<<"one">>),
+                make_enqueue(E,1,msg(<<"one">>)),
                 {down,E,noconnection},
                 make_checkout(C2, {auto,1,simple_prefetch}),
                 make_checkout(C2, cancel),
@@ -735,8 +720,8 @@ single_active_03(_Config) ->
     E = test_util:fake_pid(rabbit@fake_node2),
     Commands = [
                 make_checkout(C1, {auto,2,simple_prefetch}),
-                make_enqueue(E, 1, 0),
-                make_enqueue(E, 2, 1),
+                make_enqueue(E, 1, msg(<<0>>)),
+                make_enqueue(E, 2, msg(<<1>>)),
                 {down, Pid, noconnection},
                 {nodeup, node()}
                 ],
@@ -754,10 +739,10 @@ single_active_04(_Config) ->
     Commands = [
 
                 % make_checkout(C1, {auto,2,simple_prefetch}),
-                make_enqueue(E, 1, <<>>),
-                make_enqueue(E, 2, <<>>),
-                make_enqueue(E, 3, <<>>),
-                make_enqueue(E, 4, <<>>)
+                make_enqueue(E, 1, msg(<<>>)),
+                make_enqueue(E, 2, msg(<<>>)),
+                make_enqueue(E, 3, msg(<<>>)),
+                make_enqueue(E, 4, msg(<<>>))
                 % {down, Pid, noconnection},
                 % {nodeup, node()}
                 ],
@@ -796,29 +781,36 @@ snapshots(_Config) ->
       fun () ->
               ?FORALL({Length, Bytes, SingleActiveConsumer,
                        DeliveryLimit, InMemoryLength, InMemoryBytes,
-                       Overflow},
-                      frequency([{10, {0, 0, false, 0, 0, 0, drop_head}},
+                       Overflow, DeadLetterHandler},
+                      frequency([{10, {0, 0, false, 0, 0, 0, drop_head, undefined}},
                                  {5, {oneof([range(1, 10), undefined]),
                                       oneof([range(1, 1000), undefined]),
                                       boolean(),
                                       oneof([range(1, 3), undefined]),
                                       oneof([range(1, 10), undefined]),
                                       oneof([range(1, 1000), undefined]),
-                                      oneof([drop_head, reject_publish])
+                                      oneof([drop_head, reject_publish]),
+                                      oneof([undefined,
+                                             {at_most_once, {?MODULE, banana, []}},
+                                             at_least_once])
                                      }}]),
-                      begin
-                          Config = config(?FUNCTION_NAME,
-                                          Length,
-                                          Bytes,
-                                          SingleActiveConsumer,
-                                          DeliveryLimit,
-                                          InMemoryLength,
-                                          InMemoryBytes,
-                                          Overflow),
-                          ?FORALL(O, ?LET(Ops, log_gen(256), expand(Ops, Config)),
-                                  collect({log_size, length(O)},
-                                          snapshots_prop(Config, O)))
-                      end)
+                      %% Combination of drop_head and at_least_once is not allowed.
+                      ?IMPLIES(not (Overflow =:= drop_head andalso
+                                    DeadLetterHandler =:= at_least_once),
+                               begin
+                                   Config = config(?FUNCTION_NAME,
+                                                   Length,
+                                                   Bytes,
+                                                   SingleActiveConsumer,
+                                                   DeliveryLimit,
+                                                   InMemoryLength,
+                                                   InMemoryBytes,
+                                                   Overflow,
+                                                   DeadLetterHandler),
+                                   ?FORALL(O, ?LET(Ops, log_gen(256), expand(Ops, Config)),
+                                           collect({log_size, length(O)},
+                                                   snapshots_prop(Config, O)))
+                               end))
       end, [], 2500).
 
 single_active(_Config) ->
@@ -867,7 +859,10 @@ upgrade(_Config) ->
                                            SingleActive,
                                            DeliveryLimit,
                                            InMemoryLength,
-                                           undefined),
+                                           undefined,
+                                           drop_head,
+                                           {?MODULE, banana, []}
+                                          ),
                       ?FORALL(O, ?LET(Ops, log_gen(Size), expand(Ops, Config)),
                               collect({log_size, length(O)},
                                       upgrade_prop(Config, O)))
@@ -923,10 +918,10 @@ single_active_ordering_01(_Config) ->
     E = test_util:fake_pid(rabbit@fake_node2),
     E2 = test_util:fake_pid(rabbit@fake_node2),
     Commands = [
-                make_enqueue(E, 1, 0),
-                make_enqueue(E, 2, 1),
+                make_enqueue(E, 1, msg(<<"0">>)),
+                make_enqueue(E, 2, msg(<<"1">>)),
                 make_checkout(C1, {auto,2,simple_prefetch}),
-                make_enqueue(E2, 1, 2),
+                make_enqueue(E2, 1, msg(<<"2">>)),
                 make_settle(C1, [0])
                 ],
     Conf = config(?FUNCTION_NAME, 0, 0, true, 0, 0, 0),
@@ -945,7 +940,7 @@ single_active_ordering_02(_Config) ->
     E = test_util:fake_pid(node()),
     Commands = [
                 make_checkout(C1, {auto,1,simple_prefetch}),
-                make_enqueue(E, 2, 1),
+                make_enqueue(E, 2, msg(<<"1">>)),
                 %% CANNOT HAPPEN
                 {down,E,noproc},
                 make_settle(C1, [0])
@@ -961,9 +956,9 @@ single_active_ordering_03(_Config) ->
     C2 = {<<2>>, C2Pid},
     E = test_util:fake_pid(rabbit@fake_node2),
     Commands = [
-                make_enqueue(E, 1, 0),
-                make_enqueue(E, 2, 1),
-                make_enqueue(E, 3, 2),
+                make_enqueue(E, 1, msg(<<"0">>)),
+                make_enqueue(E, 2, msg(<<"1">>)),
+                make_enqueue(E, 3, msg(<<"2">>)),
                 make_checkout(C1, {auto,1,simple_prefetch}),
                 make_checkout(C2, {auto,1,simple_prefetch}),
                 make_settle(C1, [0]),
@@ -1045,17 +1040,34 @@ max_length(_Config) ->
                       end)
       end, [], Size).
 
-config(Name, Length, Bytes, SingleActive, DeliveryLimit,
-       InMemoryLength, InMemoryBytes) ->
-config(Name, Length, Bytes, SingleActive, DeliveryLimit,
-       InMemoryLength, InMemoryBytes, drop_head).
+dlx_01(_Config) ->
+    C1Pid = c:pid(0,883,1),
+    C1 = {<<>>, C1Pid},
+    E = c:pid(0,176,1),
+    Commands = [
+                rabbit_fifo_dlx:make_checkout(my_dlx_worker, 1),
+                make_checkout(C1, {auto,1,simple_prefetch}),
+                make_enqueue(E,1,msg(<<"1">>)),
+                make_enqueue(E,2,msg(<<"2">>)),
+                rabbit_fifo:make_discard(C1, [0]),
+                rabbit_fifo_dlx:make_settle([0]),
+                rabbit_fifo:make_discard(C1, [1]),
+                rabbit_fifo_dlx:make_settle([1])
+               ],
+    Config = config(?FUNCTION_NAME, 8, undefined, false, 2, 5, 100, reject_publish, at_least_once),
+    ?assert(snapshots_prop(Config, Commands)),
+    ok.
+
+config(Name, Length, Bytes, SingleActive, DeliveryLimit, InMemoryLength, InMemoryBytes) ->
+config(Name, Length, Bytes, SingleActive, DeliveryLimit, InMemoryLength, InMemoryBytes,
+       drop_head, {at_most_once, {?MODULE, banana, []}}).
 
 config(Name, Length, Bytes, SingleActive, DeliveryLimit,
-       InMemoryLength, InMemoryBytes, Overflow) ->
+       InMemoryLength, InMemoryBytes, Overflow, DeadLetterHandler) ->
     #{name => Name,
       max_length => map_max(Length),
       max_bytes => map_max(Bytes),
-      dead_letter_handler => {?MODULE, banana, []},
+      dead_letter_handler => DeadLetterHandler,
       single_active_consumer_on => SingleActive,
       delivery_limit => map_max(DeliveryLimit),
       max_in_memory_length => map_max(InMemoryLength),
@@ -1176,14 +1188,23 @@ messages_total_invariant() ->
                      consumers = C,
                      enqueuers = E,
                      prefix_msgs = {PTot, _, RTot, _},
-                     returns = R} = S) ->
+                     returns = R,
+                     dlx = #rabbit_fifo_dlx{discards = D,
+                                            consumer = DlxCon}} = S) ->
             Base = lqueue:len(M) + lqueue:len(R) + PTot + RTot,
             CTot = maps:fold(fun (_, #consumer{checked_out = Ch}, Acc) ->
                                      Acc + map_size(Ch)
                              end, Base, C),
-            Tot = maps:fold(fun (_, #enqueuer{pending = P}, Acc) ->
+            Tot0 = maps:fold(fun (_, #enqueuer{pending = P}, Acc) ->
                                     Acc + length(P)
                             end, CTot, E),
+            Tot1 = Tot0 + lqueue:len(D),
+            Tot = case DlxCon of
+                      undefined ->
+                          Tot1;
+                      #dlx_consumer{checked_out = DlxChecked} ->
+                          Tot1 + map_size(DlxChecked)
+                  end,
             QTot = rabbit_fifo:query_messages_total(S),
             case Tot == QTot of
                 true -> true;
@@ -1369,7 +1390,19 @@ enqueue_gen(Pid, Enq, Del) ->
     ?LET(E, {enqueue, Pid,
              frequency([{Enq, enqueue},
                         {Del, delay}]),
-             binary()}, E).
+             msg_gen()}, E).
+
+%% It's fair to assume that every message enqueued is a #basic_message containing a
+%% #'P_basic' properties record.
+%% That's what the channel expects and what rabbit_quorum_queue invokes rabbit_fifo_client with.
+msg_gen() ->
+    ?LET(Bin, binary(),
+         #basic_message{content = #content{payload_fragments_rev = [Bin],
+                                           properties = #'P_basic'{}}}).
+
+msg(Bin) when is_binary(Bin) ->
+    #basic_message{content = #content{payload_fragments_rev = [Bin],
+                                      properties = #'P_basic'{}}}.
 
 checkout_cancel_gen(Pid) ->
     {checkout, Pid, cancel}.
@@ -1550,8 +1583,7 @@ enq_effs([_ | Rem], Q) ->
 
 %% Utility
 run_proper(Fun, Args, NumTests) ->
-    ?assertEqual(
-       true,
+    ?assert(
        proper:counterexample(
          erlang:apply(Fun, Args),
          [{numtests, NumTests},

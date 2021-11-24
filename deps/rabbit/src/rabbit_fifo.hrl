@@ -34,15 +34,12 @@
 -type msg_header() :: msg_size() |
 #{size := msg_size(),
   delivery_count => non_neg_integer(),
-  expiry => milliseconds() | immediate }.
+  expiry => milliseconds()}.
 %% The message header:
 %% delivery_count: the number of unsuccessful delivery attempts.
 %%                 A non-zero value indicates a previous attempt.
 %% expiry: Epoch time in ms when a message expires. Set during enqueue.
 %%         Value is determined by per-queue or per-message message TTL.
-%%         If user sets message TTL to 0, 'expiry' gets set to 'immediate'
-%%         meaning "expire unless message can be checked out to consumer
-%%         immediately".
 %% If it only contains the size it can be condensed to an integer only
 
 -type msg() :: ?MSG(msg_header(), raw_msg()) |

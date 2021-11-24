@@ -614,9 +614,9 @@ apply(#{index := IncomingRaftIdx} = Meta, {dlx, Cmd},
       #?MODULE{dlx = DlxState0,
                messages_total = Total0,
                ra_indexes = Indexes0} = State0) when element(1, Cmd) =:= settle ->
-    {DlxState, Acked} = rabbit_fifo_dlx:apply(Cmd, DlxState0),
-    Indexes = delete_indexes(Acked, Indexes0),
-    Total = Total0 - map_size(Acked),
+    {DlxState, AckedMsgs} = rabbit_fifo_dlx:apply(Cmd, DlxState0),
+    Indexes = delete_indexes(AckedMsgs, Indexes0),
+    Total = Total0 - length(AckedMsgs),
     State1 = State0#?MODULE{dlx = DlxState,
                             messages_total = Total,
                             ra_indexes = Indexes},
@@ -783,14 +783,20 @@ purge_node(Meta, Node, State, Effects) ->
                 end, {State, Effects}, all_pids_for(Node, State)).
 
 %% any downs that re not noconnection
-handle_down(Meta, Pid, #?MODULE{consumers = Cons0,
-                                enqueuers = Enqs0} = State0) ->
+handle_down(#{system_time := DownTs} = Meta, Pid, #?MODULE{consumers = Cons0,
+                                                           enqueuers = Enqs0} = State0) ->
     % Remove any enqueuer for the same pid and enqueue any pending messages
     % This should be ok as we won't see any more enqueues from this pid
     State1 = case maps:take(Pid, Enqs0) of
                  {#enqueuer{pending = Pend}, Enqs} ->
                      lists:foldl(fun ({_, RIdx, Ts, RawMsg}, S) ->
-                                         enqueue(RIdx, Ts, RawMsg, S)
+                                         enqueue(RIdx, Ts, RawMsg, S);
+                                     ({_, RIdx, RawMsg}, S) ->
+                                         %% This is an edge case: It is an out-of-order delivery
+                                         %% from machine version 1.
+                                         %% If message TTL is configured, expiration will be delayed
+                                         %% for the time the message has been pending.
+                                         enqueue(RIdx, DownTs, RawMsg, S)
                                  end, State0#?MODULE{enqueuers = Enqs}, Pend);
                  error ->
                      State0
@@ -952,7 +958,7 @@ overview(#?MODULE{consumers = Cons,
                  num_ready_messages => messages_ready(State),
                  num_messages => messages_total(State),
                  num_release_cursors => lqueue:len(Cursors),
-                 release_cursors => [{I, messages_total(S)} || {_, I, S} <- lqueue:to_list(Cursors)],
+                 release_cursors => [I || {_, I, _} <- lqueue:to_list(Cursors)],
                  release_cursor_enqueue_counter => EnqCount,
                  enqueue_message_bytes => EnqueueBytes,
                  checkout_message_bytes => CheckoutBytes,
@@ -1459,8 +1465,6 @@ maybe_set_msg_ttl(#basic_message{content = Content},
     case min(PerMsgMsgTTL, PerQueueMsgTTL) of
         undefined ->
             Header;
-        0 ->
-            update_header(expiry, fun(Ts) -> Ts end, immediate, Header);
         TTL ->
             update_header(expiry, fun(Ts) -> Ts end, RaCmdTs + TTL, Header)
     end.
@@ -1538,7 +1542,7 @@ maybe_enqueue(RaftIdx, Ts, From, MsgSeqNo, RawMsg, Effects0,
                   pending = Pending0} = Enq0
           when MsgSeqNo > Next ->
             % out of order delivery
-            Pending = [{MsgSeqNo, RaftIdx, RawMsg} | Pending0],
+            Pending = [{MsgSeqNo, RaftIdx, Ts, RawMsg} | Pending0],
             Enq = Enq0#enqueuer{pending = lists:sort(Pending)},
             %% if the enqueue it out of order we need to mark it in the
             %% index
@@ -1577,25 +1581,25 @@ complete(Meta, ConsumerId, DiscardedMsgIds,
     %% credit_mode = simple_prefetch should automatically top-up credit
     %% as messages are simple_prefetch or otherwise returned
     Discarded = maps:with(DiscardedMsgIds, Checked),
+    DiscardedMsgs = maps:values(Discarded),
+    Len = length(DiscardedMsgs),
     Con = Con0#consumer{checked_out = maps:without(DiscardedMsgIds, Checked),
-                        credit = increase_credit(Con0, map_size(Discarded))},
+                        credit = increase_credit(Con0, Len)},
     State1 = update_or_remove_sub(Meta, ConsumerId, Con, State0),
-    State = maps:fold(fun(_, Msg, Acc) ->
-                              add_bytes_settle(
-                                get_msg_header(Msg), Acc)
-                      end, State1, Discarded),
+    State = lists:foldl(fun(Msg, Acc) ->
+                                add_bytes_settle(
+                                  get_msg_header(Msg), Acc)
+                        end, State1, DiscardedMsgs),
     case Delete of
         true ->
-            Indexes = delete_indexes(Discarded, Indexes0),
-            State#?MODULE{messages_total = Tot - length(DiscardedMsgIds),
+            Indexes = delete_indexes(DiscardedMsgs, Indexes0),
+            State#?MODULE{messages_total = Tot - Len,
                           ra_indexes = Indexes};
         false ->
             State
     end.
 
-delete_indexes(Msgs, Indexes) when is_map(Msgs) ->
-    delete_indexes(maps:values(Msgs), Indexes);
-delete_indexes(Msgs, Indexes) when is_list(Msgs) ->
+delete_indexes(Msgs, Indexes) ->
     %% TODO: optimise by passing a list to rabbit_fifo_index
     lists:foldl(fun (?INDEX_MSG(I, _), Acc) when is_integer(I) ->
                         rabbit_fifo_index:delete(I, Acc);
@@ -2076,13 +2080,12 @@ checkout_one(#{system_time := Ts} = Meta, InitState0, Effects0) ->
             %% consumer did not exist but was queued, recurse
             checkout_one(Meta, InitState#?MODULE{service_queue = SQ1}, Effects1);
         {empty, _} ->
-            Effects2 = timer_effect(Ts, InitState, Effects1),
+            Effects = timer_effect(Ts, InitState, Effects1),
             case lqueue:len(Messages0) of
                 0 ->
-                    {nochange, InitState, Effects2};
+                    {nochange, InitState, Effects};
                 _ ->
-                    {State, Effects} = maybe_remove_immediate_msg(InitState, Effects2),
-                    {inactive, State, Effects}
+                    {inactive, InitState, Effects}
             end
     end.
 
@@ -2090,7 +2093,13 @@ checkout_one(#{system_time := Ts} = Meta, InitState0, Effects0) ->
 expire_msgs(RaCmdTs, State0, Effects0) ->
     case take_next_msg(State0) of
         {?INDEX_MSG(Idx, ?MSG(#{expiry := Expiry} = Header, _) = Msg) = FullMsg, State1}
-          when is_number(Expiry), RaCmdTs >= Expiry -> %%TODO RaCmdTs > Expiry is good enough to not treat TTL=0 special
+          when RaCmdTs > Expiry ->
+            %% We use ">" rathern than ">=" because we do not want to treat a message TTL of 0 as special case.
+            %% If TTL was set to 0 and the message will not be checked out to any consumer, it will expire the next millisecond
+            %% or whenever the next checkout/4,5 runs. If the next checkout runs within the same
+            %% millisecond, we do not comply exaclty with the "TTL=0 models AMQP immediate flag" semantics as done for classic
+            %% queues where the message is discarded if it cannot be consumed immediately. This behaviour should be good enough
+            %% for all use cases.
             #?MODULE{dlx = DlxState0,
                      cfg = #cfg{dead_letter_handler = DLH},
                      ra_indexes = Indexes0} = State2 = add_bytes_drop(Header, State1),
@@ -2112,13 +2121,33 @@ expire_msgs(RaCmdTs, State0, Effects0) ->
                     State = State4#?MODULE{ra_indexes = Indexes},
                     expire_msgs(RaCmdTs, State, Effects)
             end;
-        %%TODO re-use drop_head code
-        {?PREFIX_MEM_MSG(_Header), _State1} ->
-            exit(not_implemented);
-        {?DISK_MSG(_Header), _State1} ->
-            exit(not_implemented);
+        {?PREFIX_MEM_MSG(#{expiry := Expiry} = Header) = Msg, State1}
+          when RaCmdTs > Expiry ->
+            State2 = expire_prefix_msg(Msg, Header, State1),
+            expire_msgs(RaCmdTs, State2, Effects0);
+        {?DISK_MSG(#{expiry := Expiry} = Header) = Msg, State1}
+          when RaCmdTs > Expiry ->
+            State2 = expire_prefix_msg(Msg, Header, State1),
+            expire_msgs(RaCmdTs, State2, Effects0);
         _ ->
             {State0, Effects0}
+    end.
+
+expire_prefix_msg(Msg, Header, State0) ->
+    #?MODULE{dlx = DlxState0,
+             cfg = #cfg{dead_letter_handler = DLH}} = State1 = add_bytes_drop(Header, State0),
+    case DLH of
+        at_least_once ->
+            DlxState = rabbit_fifo_dlx:discard(Msg, expired, DlxState0),
+            State1#?MODULE{dlx = DlxState};
+        _ ->
+            State2 = case Msg of
+                         ?DISK_MSG(_) ->
+                             State1;
+                         _ ->
+                             subtract_in_memory_counts(Header, State1)
+                     end,
+            decr_total(State2)
     end.
 
 %%TODO make sure effect is re-issued when becoming leader
@@ -2134,50 +2163,6 @@ timer_effect(RaCmdTs, State, Effects) ->
                 infinity
         end,
     [{timer, expire_msgs, T} | Effects].
-
-
-%%TODO Do not treat TTL=0 special.
-%%TODO instead of this method, check in expire_msgs() whether checkout Raft command ID
-%% is same as enqueue Raft command ID. If not, remove.
-%%
-%% Drops or dead-letters a message that got just enqueued but could not be checked out
-%% to a consumer immediately.
-%%
-%% This behaviour complies with classic queues. Docs:
-%% "Setting the TTL to 0 causes messages to be expired upon reaching a queue
-%% unless they can be delivered to a consumer immediately.
-%% Thus this provides an alternative to the immediate publishing flag,
-%% which the RabbitMQ server does not support.
-%% Unlike that flag, no basic.returns are issued,
-%% and if a dead letter exchange is set then messages will be dead-lettered."
-maybe_remove_immediate_msg(#?MODULE{messages = Messages0} = State0, Effects0) ->
-    case lqueue:out_r(Messages0) of
-        {{value, ?INDEX_MSG(Idx, ?MSG(#{expiry := immediate} = Header, _) = Msg) = FullMsg}, Messages} ->
-            State1 = State0#?MODULE{messages = Messages},
-            #?MODULE{dlx = DlxState0,
-                     cfg = #cfg{dead_letter_handler = DLH},
-                     ra_indexes = Indexes0} = State2 = add_bytes_drop(Header, State1),
-            case DLH of
-                at_least_once ->
-                    Indexes = rabbit_fifo_index:append(Idx, Indexes0),
-                    DlxState = rabbit_fifo_dlx:discard(FullMsg, expired, DlxState0),
-                    State = State2#?MODULE{dlx = DlxState,
-                                           ra_indexes = Indexes},
-                    {State, Effects0};
-                _ ->
-                    State3 = decr_total(State2),
-                    State = case Msg of
-                                ?DISK_MSG(_) -> State3;
-                                _ ->
-                                    subtract_in_memory_counts(Header, State3)
-                            end,
-                    Effects = dead_letter_effects(expired, [FullMsg],
-                                                  State, Effects0),
-                    {State, Effects}
-            end;
-        _ ->
-            {State0, Effects0}
-    end.
 
 update_or_remove_sub(_Meta, ConsumerId, #consumer{lifetime = auto,
                                                   credit = 0} = Con,

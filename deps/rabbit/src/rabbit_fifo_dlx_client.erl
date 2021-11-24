@@ -46,13 +46,13 @@ process_command(Cmd, #state{leader = Leader} = State, Tries) ->
             process_command(Cmd, State, Tries - 1)
     end.
 
-handle_ra_event(Leader, {machine, {delivery, _} = Del}, #state{leader = Leader} = State) ->
+handle_ra_event(Leader, {machine, {dlx_delivery, _} = Del}, #state{leader = Leader} = State) ->
     handle_delivery(Del, State);
 handle_ra_event(_From, Evt, State) ->
     rabbit_log:warning("~s received unknown ra event: ~p", [?MODULE, Evt]),
     {ok, State, []}.
 
-handle_delivery({delivery, [{FstId, _} | _] = IdMsgs},
+handle_delivery({dlx_delivery, [{FstId, _} | _] = IdMsgs},
                 #state{queue_resource = QRes,
                        last_msg_id = Prev} = State0) ->
     %% format as a deliver action
@@ -75,7 +75,7 @@ handle_delivery({delivery, [{FstId, _} | _] = IdMsgs},
                 [] ->
                     {ok, State0, []};
                 IdMsgs2 ->
-                    handle_delivery({delivery, IdMsgs2}, State0)
+                    handle_delivery({dlx_delivery, IdMsgs2}, State0)
             end;
         _ when FstId =:= 0 ->
             % the very first delivery
